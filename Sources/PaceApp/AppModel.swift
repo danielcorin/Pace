@@ -46,7 +46,6 @@ final class AppModel: ObservableObject {
         }
     }
     @Published private(set) var capturePausedUntil: Date?
-    @Published var pasteTargetName: String?
     @Published var statusMessage: String?
     @Published private(set) var launchesAtLogin = SMAppService.mainApp.status == .enabled
 
@@ -394,6 +393,7 @@ final class AppModel: ObservableObject {
                 let mode: ClipboardRestoreMode
                 switch request.arguments["mode"] {
                 case "plainText": mode = .plainText
+                case "singleLine": mode = .trimmedSingleLine
                 case "ocrText": mode = .ocrText
                 default: mode = .original
                 }

@@ -160,6 +160,7 @@ struct PasteboardSnapshot: Sendable {
 enum ClipboardRestoreMode {
     case original
     case plainText
+    case trimmedSingleLine
     case ocrText
 }
 
@@ -170,6 +171,13 @@ extension ClipboardItem {
 
         if mode == .plainText, let plainText {
             pasteboard.setString(plainText, forType: .string)
+            return
+        }
+        if mode == .trimmedSingleLine {
+            guard let text = plainText ?? ocrText else {
+                throw PaceError.notFound("No text is available for this item.")
+            }
+            pasteboard.setString(text.trimmedSingleLine, forType: .string)
             return
         }
         if mode == .ocrText {

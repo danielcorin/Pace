@@ -17,6 +17,7 @@ struct PreferencesView: View {
     @State private var isCleaningUp = false
     @State private var cliFeedback: Feedback?
     @State private var shortcutMessage: String?
+    @State private var panelShortcuts: [PanelAction: HotKeyShortcut] = [:]
 
     private struct Feedback: Equatable {
         var message: String
@@ -41,6 +42,9 @@ struct PreferencesView: View {
             generalTab
                 .tabItem { Label("General", systemImage: "gearshape") }
 
+            shortcutsTab
+                .tabItem { Label("Shortcuts", systemImage: "command") }
+
             retentionTab
                 .tabItem { Label("Retention", systemImage: "clock.arrow.circlepath") }
         }
@@ -56,24 +60,6 @@ struct PreferencesView: View {
 
     private var generalTab: some View {
         Form {
-            Section {
-                LabeledContent {
-                    HotKeyRecorder(
-                        shortcut: currentShortcut,
-                        onBeginRecording: { AppRuntime.shared.suspendHotKey() },
-                        onComplete: finishRecording
-                    )
-                    .frame(width: 150, height: 28)
-                } label: {
-                    Text("Show Pace")
-                    Text("Global keyboard shortcut to open the clipboard panel")
-                }
-
-                if let shortcutMessage {
-                    feedbackRow(shortcutMessage, systemImage: "exclamationmark.triangle.fill", color: .orange)
-                }
-            }
-
             Section {
                 Toggle(isOn: $model.capturePaused) {
                     Text("Pause clipboard capture")
@@ -127,6 +113,57 @@ struct PreferencesView: View {
                         Text("Pace \(appVersion)")
                     }
                 }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    // MARK: - Shortcuts
+
+    private var shortcutsTab: some View {
+        Form {
+            Section {
+                LabeledContent {
+                    HotKeyRecorder(
+                        shortcut: currentShortcut,
+                        onBeginRecording: { AppRuntime.shared.suspendHotKey() },
+                        onComplete: finishRecording
+                    )
+                    .frame(width: 150, height: 28)
+                } label: {
+                    Text("Show Pace")
+                    Text("Global keyboard shortcut to open the clipboard panel")
+                }
+            }
+
+            Section {
+                ForEach(PanelAction.allCases) { action in
+                    LabeledContent {
+                        HotKeyRecorder(
+                            shortcut: panelShortcut(for: action),
+                            captureContext: .panel,
+                            actionName: action.title,
+                            onBeginRecording: { AppRuntime.shared.suspendHotKey() },
+                            onComplete: { finishPanelRecording(for: action, shortcut: $0) }
+                        )
+                        .frame(width: 150, height: 28)
+                    } label: {
+                        Text(action.title)
+                        Text(action.subtitle)
+                    }
+                }
+
+                if let shortcutMessage {
+                    feedbackRow(shortcutMessage, systemImage: "exclamationmark.triangle.fill", color: .orange)
+                }
+            } header: {
+                Text("In the Panel")
+            } footer: {
+                HStack {
+                    Spacer()
+                    Button("Restore Defaults") { restoreDefaultPanelShortcuts() }
+                }
+                .padding(.top, 4)
             }
         }
         .formStyle(.grouped)
@@ -329,6 +366,11 @@ struct PreferencesView: View {
             return
         }
 
+        if let taken = PanelAction.allCases.first(where: { panelShortcut(for: $0) == shortcut }) {
+            _ = AppRuntime.shared.updateHotKey(currentShortcut)
+            showShortcutConflict(with: taken.title)
+            return
+        }
         if AppRuntime.shared.updateHotKey(shortcut) {
             hotKeyRawValue = shortcut.storedValue
             withAnimation(Self.quickFade) { shortcutMessage = nil }
@@ -338,6 +380,45 @@ struct PreferencesView: View {
                 shortcutMessage = "That shortcut is already in use. Your previous shortcut is still active."
             }
         }
+    }
+
+    // Recording suspends the global hotkey so pressing it doesn't toggle the
+    // panel; every exit path must restore it.
+    private func finishPanelRecording(for action: PanelAction, shortcut: HotKeyShortcut?) {
+        _ = AppRuntime.shared.updateHotKey(currentShortcut)
+        guard let shortcut else { return }
+
+        if shortcut == currentShortcut {
+            showShortcutConflict(with: "Show Pace")
+            return
+        }
+        if let taken = PanelAction.allCases.first(where: {
+            $0 != action && panelShortcut(for: $0) == shortcut
+        }) {
+            showShortcutConflict(with: taken.title)
+            return
+        }
+        PanelShortcuts.set(shortcut, for: action)
+        panelShortcuts[action] = shortcut
+        withAnimation(Self.quickFade) { shortcutMessage = nil }
+    }
+
+    private func showShortcutConflict(with name: String) {
+        withAnimation(Self.quickFade) {
+            shortcutMessage = "That shortcut is already used by \(name). Your previous shortcut is still active."
+        }
+    }
+
+    private func panelShortcut(for action: PanelAction) -> HotKeyShortcut {
+        panelShortcuts[action] ?? PanelShortcuts.shortcut(for: action)
+    }
+
+    private func restoreDefaultPanelShortcuts() {
+        PanelShortcuts.restoreDefaults()
+        for action in PanelAction.allCases {
+            panelShortcuts[action] = action.defaultShortcut
+        }
+        withAnimation(Self.quickFade) { shortcutMessage = nil }
     }
 
     private func installCLI() {
@@ -361,5 +442,8 @@ struct PreferencesView: View {
         items = policy.maximumItemCount.map(String.init) ?? "10000"
         storageMB = policy.maximumStorageBytes.map { String($0 / 1_000_000) } ?? "1000"
         protectsPinnedItems = policy.protectsPinnedItems
+        for action in PanelAction.allCases {
+            panelShortcuts[action] = PanelShortcuts.shortcut(for: action)
+        }
     }
 }

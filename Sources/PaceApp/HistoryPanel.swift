@@ -106,7 +106,6 @@ final class HistoryPanelCoordinator {
         if frontmost?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             targetApplication = frontmost
         }
-        model.pasteTargetName = targetApplication?.localizedName
         // Unlocking needs no user interaction; never surface a locked panel.
         if model.vaultState == .locked {
             Task { await model.unlock() }
@@ -443,18 +442,6 @@ struct HistoryView: View {
             footer
         }
         .overlay {
-            Button("") { performCopy() }
-                .keyboardShortcut(.return, modifiers: [.command])
-                .opacity(0)
-                .allowsHitTesting(false)
-            Button("") { performPaste(mode: .plainText) }
-                .keyboardShortcut(.return, modifiers: [.shift])
-                .opacity(0)
-                .allowsHitTesting(false)
-            Button("") { performPaste(mode: .ocrText) }
-                .keyboardShortcut(.return, modifiers: [.option])
-                .opacity(0)
-                .allowsHitTesting(false)
             Button("") { moveSelection(1) }
                 .keyboardShortcut(.downArrow, modifiers: [])
                 .opacity(0)
@@ -643,6 +630,8 @@ struct HistoryView: View {
                 }
                 Button("Paste as Plain Text") { onPaste(record, .plainText) }
                     .disabled(record.kind == .image || record.kind == .files)
+                Button("Paste as Single Line") { onPaste(record, .trimmedSingleLine) }
+                    .disabled((record.kind == .image || record.kind == .files) && !record.hasOCR)
                 Button("Paste OCR Text") { onPaste(record, .ocrText) }
                     .disabled(!record.hasOCR)
                 Button("Copy") { onCopy(record, .original) }
@@ -656,13 +645,7 @@ struct HistoryView: View {
     }
 
     private var footer: some View {
-        HStack(spacing: 14) {
-            hint("↑↓", "Navigate")
-            hint("↩", pasteHintLabel)
-            hint("⌘↩", "Copy")
-            hint("⇧↩", "Plain Text")
-            hint("⌥↩", "OCR Text")
-            hint("⌘⌫", "Delete")
+        HStack {
             Spacer()
             Text("\(model.records.count) shown")
                 .foregroundStyle(.secondary)
@@ -670,20 +653,6 @@ struct HistoryView: View {
         .font(.caption)
         .padding(.horizontal, 14)
         .frame(height: 30)
-    }
-
-    private var pasteHintLabel: String {
-        if let target = model.pasteTargetName, !target.isEmpty {
-            return "Paste to \(target)"
-        }
-        return "Paste"
-    }
-
-    private func hint(_ keys: String, _ label: String) -> some View {
-        HStack(spacing: 4) {
-            Text(keys).foregroundStyle(.secondary)
-            Text(label).foregroundStyle(.tertiary)
-        }
     }
 
     private func pasteNumbered(_ number: Int) {
@@ -700,7 +669,8 @@ struct HistoryView: View {
 
     // The search field's editor consumes some modified keys before hidden
     // shortcut buttons see them. Intercept panel-wide commands here so they
-    // work consistently regardless of focus.
+    // work consistently regardless of focus, matching the user-configured
+    // shortcuts from Settings.
     private func installShortcutMonitor() {
         guard shortcutKeyMonitor == nil else { return }
         shortcutKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
@@ -708,10 +678,6 @@ struct HistoryView: View {
             let modifiers = event.modifierFlags.intersection([.command, .option, .shift, .control])
             if event.keyCode == 43, modifiers == .command {  // ⌘,
                 NotificationCenter.default.post(name: .paceOpenSettings, object: nil)
-                return nil
-            }
-            if event.keyCode == 51, modifiers == .command {  // ⌘⌫
-                deleteSelected()
                 return nil
             }
             if event.keyCode == 126, modifiers == .command {  // ⌘↑
@@ -722,31 +688,29 @@ struct HistoryView: View {
                 selection = model.records.last?.id
                 return nil
             }
-            guard event.keyCode == 36 || event.keyCode == 76 else { return event }
-            if modifiers == .command {
-                performCopy()
-                return nil
-            }
-            if modifiers == .option {
-                performPaste(mode: .ocrText)
-                return nil
-            }
-            if modifiers == .shift {
-                performPaste(mode: .plainText)
-                return nil
-            }
-            if modifiers.isEmpty {
+            guard let action = PanelShortcuts.action(matching: event) else { return event }
+            if action == .paste, modifiers.isEmpty,
+               event.keyCode == 36 || event.keyCode == 76,
+               let textView = NSApp.keyWindow?.firstResponder as? NSTextView,
+               textView.isEditable {
                 // When the search field's editor has focus, its onSubmit
                 // handles Return. Anywhere else — including when focus never
                 // landed — Return still pastes the selection.
-                if let textView = NSApp.keyWindow?.firstResponder as? NSTextView,
-                   textView.isEditable {
-                    return event
-                }
-                performPaste(mode: .original)
-                return nil
+                return event
             }
-            return event
+            perform(action)
+            return nil
+        }
+    }
+
+    private func perform(_ action: PanelAction) {
+        switch action {
+        case .paste: performPaste(mode: .original)
+        case .pastePlainText: performPaste(mode: .plainText)
+        case .pasteSingleLine: performPaste(mode: .trimmedSingleLine)
+        case .pasteOCRText: performPaste(mode: .ocrText)
+        case .copy: performCopy()
+        case .delete: deleteSelected()
         }
     }
 
@@ -779,8 +743,16 @@ struct HistoryView: View {
     }
 
     private func performPaste(mode: ClipboardRestoreMode) {
-        let record = selectedRecord ?? model.records.first
-        if let record, mode != .ocrText || record.hasOCR { onPaste(record, mode) }
+        guard let record = selectedRecord ?? model.records.first else { return }
+        switch mode {
+        case .ocrText:
+            guard record.hasOCR else { return }
+        case .trimmedSingleLine:
+            guard record.kind != .image && record.kind != .files || record.hasOCR else { return }
+        case .original, .plainText:
+            break
+        }
+        onPaste(record, mode)
     }
 
     private func selectFirstIfNeeded() {

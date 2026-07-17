@@ -55,20 +55,57 @@ struct HotKeyShortcut: Equatable {
         return label + Self.keyLabels[keyCode, default: "Key \(keyCode)"]
     }
 
-    static func from(event: NSEvent) -> HotKeyShortcut? {
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    enum CaptureContext {
+        /// System-wide Carbon hotkey; needs ⌘, ⌥, or ⌃.
+        case globalHotKey
+        /// Panel-local shortcut; Return and function keys may stand alone.
+        case panel
+    }
+
+    static func from(event: NSEvent, context: CaptureContext = .globalHotKey) -> HotKeyShortcut? {
+        let modifiers = carbonModifiers(from: event.modifierFlags)
+
+        // A shortcut without one of these modifiers is too easy to trigger
+        // while typing. Shift can still be used in addition to any of them.
+        // Panel shortcuts additionally allow bare Return and function keys,
+        // which never conflict with typing in the search field.
+        let primaryModifiers = UInt32(cmdKey | optionKey | controlKey)
+        switch context {
+        case .globalHotKey:
+            guard modifiers & primaryModifiers != 0 else { return nil }
+            return HotKeyShortcut(keyCode: UInt32(event.keyCode), modifiers: modifiers)
+        case .panel:
+            let keyCode = normalizedKeyCode(UInt32(event.keyCode))
+            guard modifiers & primaryModifiers != 0 || modifierFreeKeys.contains(keyCode) else {
+                return nil
+            }
+            return HotKeyShortcut(keyCode: keyCode, modifiers: modifiers)
+        }
+    }
+
+    static func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
+        let flags = flags.intersection(.deviceIndependentFlagsMask)
         var modifiers: UInt32 = 0
         if flags.contains(.command) { modifiers |= UInt32(cmdKey) }
         if flags.contains(.option) { modifiers |= UInt32(optionKey) }
         if flags.contains(.shift) { modifiers |= UInt32(shiftKey) }
         if flags.contains(.control) { modifiers |= UInt32(controlKey) }
-
-        // A global shortcut without one of these modifiers is too easy to trigger
-        // while typing. Shift can still be used in addition to any of them.
-        let primaryModifiers = UInt32(cmdKey | optionKey | controlKey)
-        guard modifiers & primaryModifiers != 0 else { return nil }
-        return HotKeyShortcut(keyCode: UInt32(event.keyCode), modifiers: modifiers)
+        return modifiers
     }
+
+    /// The main Return key and the keypad Enter key act as one shortcut.
+    static func normalizedKeyCode(_ keyCode: UInt32) -> UInt32 {
+        keyCode == UInt32(kVK_ANSI_KeypadEnter) ? UInt32(kVK_Return) : keyCode
+    }
+
+    private static let modifierFreeKeys: Set<UInt32> = [
+        UInt32(kVK_Return),
+        UInt32(kVK_F1), UInt32(kVK_F2), UInt32(kVK_F3), UInt32(kVK_F4),
+        UInt32(kVK_F5), UInt32(kVK_F6), UInt32(kVK_F7), UInt32(kVK_F8),
+        UInt32(kVK_F9), UInt32(kVK_F10), UInt32(kVK_F11), UInt32(kVK_F12),
+        UInt32(kVK_F13), UInt32(kVK_F14), UInt32(kVK_F15), UInt32(kVK_F16),
+        UInt32(kVK_F17), UInt32(kVK_F18), UInt32(kVK_F19), UInt32(kVK_F20)
+    ]
 
     private static let supportedCarbonModifiers = UInt32(cmdKey | optionKey | shiftKey | controlKey)
 

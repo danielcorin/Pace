@@ -4,27 +4,34 @@ import SwiftUI
 
 struct HotKeyRecorder: NSViewRepresentable {
     let shortcut: HotKeyShortcut
+    var captureContext: HotKeyShortcut.CaptureContext = .globalHotKey
+    var actionName = "Show Pace"
     let onBeginRecording: () -> Void
     let onComplete: (HotKeyShortcut?) -> Void
 
     func makeNSView(context: Context) -> HotKeyRecorderButton {
         let button = HotKeyRecorderButton()
-        button.shortcut = shortcut
-        button.onBeginRecording = onBeginRecording
-        button.onComplete = onComplete
+        configure(button)
         return button
     }
 
     func updateNSView(_ button: HotKeyRecorderButton, context: Context) {
+        configure(button)
+        button.refreshTitle()
+    }
+
+    private func configure(_ button: HotKeyRecorderButton) {
         button.shortcut = shortcut
+        button.captureContext = captureContext
         button.onBeginRecording = onBeginRecording
         button.onComplete = onComplete
-        button.refreshTitle()
+        button.setAccessibilityLabel("\(actionName) keyboard shortcut")
     }
 }
 
 final class HotKeyRecorderButton: NSButton {
     var shortcut = HotKeyShortcut.defaultShortcut
+    var captureContext = HotKeyShortcut.CaptureContext.globalHotKey
     var onBeginRecording: (() -> Void)?
     var onComplete: ((HotKeyShortcut?) -> Void)?
 
@@ -39,8 +46,7 @@ final class HotKeyRecorderButton: NSButton {
         setButtonType(.momentaryPushIn)
         font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
         focusRingType = .exterior
-        setAccessibilityLabel("Show Pace keyboard shortcut")
-        setAccessibilityHelp("Press to record a new global keyboard shortcut")
+        setAccessibilityHelp("Press to record a new keyboard shortcut")
         refreshTitle()
     }
 
@@ -92,7 +98,7 @@ final class HotKeyRecorderButton: NSButton {
             finish(with: nil)
             return
         }
-        guard let shortcut = HotKeyShortcut.from(event: event) else {
+        guard let shortcut = HotKeyShortcut.from(event: event, context: captureContext) else {
             NSSound.beep()
             title = "Add ⌘, ⌥, or ⌃"
             return
