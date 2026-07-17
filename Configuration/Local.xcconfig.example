@@ -1,0 +1,4 @@
+// Copy to Local.xcconfig (git-ignored) and fill in your own values.
+//   cp Configuration/Local.xcconfig.example Configuration/Local.xcconfig
+DEVELOPMENT_TEAM = ABCDE12345
+PRODUCT_BUNDLE_IDENTIFIER = com.example.Pace

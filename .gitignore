@@ -1,0 +1,23 @@
+.DS_Store
+
+# XcodeGen output — regenerated from project.yml, never committed.
+*.xcodeproj
+
+# Xcode user and build output
+DerivedData/
+build/
+dist/
+*.xcarchive
+*.dSYM
+*.xcuserstate
+xcuserdata/
+
+# Swift Package Manager local output
+.build/
+.swiftpm/
+
+# Per-developer signing configuration
+Configuration/Local.xcconfig
+
+# direnv / secrets
+/.env

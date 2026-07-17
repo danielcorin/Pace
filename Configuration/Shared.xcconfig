@@ -1,0 +1,6 @@
+// Safe defaults for source builds. Local.xcconfig is intentionally git-ignored.
+// Real signing values (your Team ID and a unique bundle id) go in Local.xcconfig.
+DEVELOPMENT_TEAM =
+PRODUCT_BUNDLE_IDENTIFIER = com.example.Pace
+
+#include? "Local.xcconfig"

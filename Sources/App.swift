@@ -1,10 +1,3 @@
-//
-//  PaceApp.swift
-//  Pace
-//
-//  Created by Daniel Corin on 7/16/26.
-//
-
 import SwiftUI
 
 @main
@@ -13,5 +6,6 @@ struct PaceApp: App {
         WindowGroup {
             ContentView()
         }
+        .windowResizability(.contentSize)
     }
 }
