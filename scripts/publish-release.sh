@@ -6,31 +6,34 @@ usage() {
     cat <<'EOF'
 Usage:
   scripts/publish-release.sh [options]
-  scripts/publish-release.sh /path/to/App.app [options]
-  scripts/publish-release.sh --setup-notary-profile PROFILE --apple-id APPLE_ID
+  scripts/publish-release.sh /path/to/Pace.app [options]
+  scripts/publish-release.sh --setup-notary-profile PROFILE
 
 With no app path, the script performs the complete release workflow: archive a
 universal Release build, Developer ID-sign and upload it with Xcode, wait for
 notarization, export the stapled app, create a ZIP and signed/notarized DMG,
-verify them, and optionally publish a GitHub Release.
+verify them, optionally publish a GitHub Release, then install and launch the
+verified app from /Applications.
 
 An existing notarized app path skips the archive/upload/export steps.
 
 Release options:
   --version VERSION          Assert the configured app version.
   --build BUILD              Assert the configured build number.
-  --project PATH             Xcode project (default: the sole .xcodeproj here).
-  --scheme NAME              Xcode scheme (default: the project's base name).
+  --project PATH             Xcode project (default: Pace.xcodeproj).
+  --scheme NAME              Xcode scheme (default: Pace).
   --configuration NAME       Build configuration (default: Release).
-  --team-id ID               Override TEAM_ID or the resolved DEVELOPMENT_TEAM.
-  --identity IDENTITY        Override DEVELOPER_ID_APPLICATION signing identity.
-  --notary-profile PROFILE   notarytool Keychain profile for the outer DMG.
+  --team-id ID               Override TEAM_ID and the resolved Xcode team.
+  --identity IDENTITY        Override DEVELOPER_ID_APPLICATION.
+  --notary-profile PROFILE   notarytool Keychain profile for the outer DMG
+                             (default: PaceNotary).
   --notary-timeout SECONDS   App notarization wait limit (default: 1800).
   --output-dir PATH          Artifact directory (default: dist).
   --publish                  Create the corresponding GitHub Release.
   --repo OWNER/REPO          GitHub repository passed to gh.
   --replace-existing-release Replace assets on an existing release tag.
   --skip-dmg-notarization    Explicitly leave the signed outer DMG unnotarized.
+  --skip-install             Do not replace and relaunch /Applications/Pace.app.
   --allow-dirty              Allow a source build from an uncommitted tree.
                              This cannot be combined with --publish.
   --keep-work-dir            Preserve temporary archive/export files.
@@ -39,18 +42,16 @@ Release options:
 Credential setup:
   --setup-notary-profile PROFILE
                              Store an app-specific password in Keychain.
-  --apple-id APPLE_ID        Override APPLE_ID for credential setup. The password
-                             comes from APPLE_ID_PASSWORD or a secure prompt.
+  --apple-id APPLE_ID        Override APPLE_ID for credential setup. The
+                             password comes from APPLE_ID_PASSWORD when set;
+                             otherwise it is requested with a secure prompt.
 
 Environment equivalents:
   APPLE_ID, APPLE_ID_PASSWORD, DEVELOPER_ID_APPLICATION, TEAM_ID,
   NOTARY_PROFILE, NOTARY_TIMEOUT, RELEASE_OUTPUT_DIR, GH_REPO
 
-Legacy aliases remain supported:
-  DEVELOPER_IDENTITY, DEVELOPMENT_TEAM, NOTARY_APPLE_ID
-
-For DMG notarization, export APPLE_ID, APPLE_ID_PASSWORD, and TEAM_ID, or use a
-NOTARY_PROFILE stored in Keychain. APPLE_ID_PASSWORD is never printed.
+Legacy environment aliases:
+  NOTARY_APPLE_ID, DEVELOPER_IDENTITY, DEVELOPMENT_TEAM
 
 The project version and build number must already be committed. --version and
 --build verify those values; they never rewrite or silently override the source.
@@ -70,15 +71,36 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
 }
 
-notarytool_with_auth() {
-    if [[ "$NOTARY_AUTH_MODE" == "profile" ]]; then
-        xcrun notarytool "$@" --keychain-profile "$NOTARY_PROFILE"
-    else
-        xcrun notarytool "$@" \
+store_notary_profile() {
+    local profile="$1"
+
+    if [[ -n "$APPLE_ID_PASSWORD" ]]; then
+        echo "Using APPLE_ID_PASSWORD to seed the Keychain profile."
+        xcrun notarytool store-credentials "$profile" \
             --apple-id "$APPLE_ID" \
-            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$TEAM_ID" \
+            --password "$APPLE_ID_PASSWORD"
+    else
+        echo "notarytool will securely prompt for an app-specific password."
+        xcrun notarytool store-credentials "$profile" \
+            --apple-id "$APPLE_ID" \
             --team-id "$TEAM_ID"
     fi
+}
+
+ensure_notary_profile() {
+    if xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+        return
+    fi
+
+    if [[ -z "$APPLE_ID" || -z "$APPLE_ID_PASSWORD" ]]; then
+        fail "notary profile '$NOTARY_PROFILE' is unavailable; set APPLE_ID and APPLE_ID_PASSWORD or run --setup-notary-profile"
+    fi
+
+    echo "Notary profile '$NOTARY_PROFILE' is unavailable; creating it from release environment variables..."
+    store_notary_profile "$NOTARY_PROFILE"
+    xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null || \
+        fail "notary profile '$NOTARY_PROFILE' is unavailable or invalid"
 }
 
 load_build_settings() {
@@ -207,13 +229,15 @@ prepare_github_release() {
     [[ "$HEAD_COMMIT" == "$upstream_commit" ]] || \
         fail "the current branch differs from $upstream; push or pull before publishing"
 
-    GH_ARGS=()
-    if [[ -n "$GH_REPOSITORY" ]]; then
-        GH_ARGS=(--repo "$GH_REPOSITORY")
+    if [[ -z "$GH_REPOSITORY" ]]; then
+        GH_REPOSITORY="$(gh repo view --json nameWithOwner --jq .nameWithOwner)" || \
+            fail "could not resolve the GitHub repository; pass --repo OWNER/REPO"
     fi
+    [[ -n "$GH_REPOSITORY" ]] || fail "could not resolve the GitHub repository; pass --repo OWNER/REPO"
+    GH_ARGS=(--repo "$GH_REPOSITORY")
 
     RELEASE_EXISTS=0
-    if gh release view "$TAG" ${GH_ARGS[@]+"${GH_ARGS[@]}"} >/dev/null 2>&1; then
+    if gh release view "$TAG" "${GH_ARGS[@]}" >/dev/null 2>&1; then
         RELEASE_EXISTS=1
         [[ "$REPLACE_EXISTING" -eq 1 ]] || \
             fail "GitHub Release $TAG already exists; bump the version or pass --replace-existing-release"
@@ -301,22 +325,69 @@ cleanup() {
     fi
 }
 
+install_and_launch_app() {
+    local install_dir="/Applications"
+    local install_path="$install_dir/$PRODUCT_NAME.app"
+    local staging_dir staged_app attempt
+
+    echo "Installing $PRODUCT_NAME in $install_dir..."
+
+    if pgrep -x "$PRODUCT_NAME" >/dev/null; then
+        echo "Closing the running $PRODUCT_NAME app..."
+        osascript -e "tell application \"$PRODUCT_NAME\" to quit" >/dev/null 2>&1 || true
+
+        for ((attempt = 0; attempt < 50; attempt++)); do
+            pgrep -x "$PRODUCT_NAME" >/dev/null || break
+            sleep 0.1
+        done
+
+        if pgrep -x "$PRODUCT_NAME" >/dev/null; then
+            echo "$PRODUCT_NAME did not quit in time; sending SIGTERM..."
+            pkill -TERM -x "$PRODUCT_NAME" || true
+            for ((attempt = 0; attempt < 50; attempt++)); do
+                pgrep -x "$PRODUCT_NAME" >/dev/null || break
+                sleep 0.1
+            done
+        fi
+
+        pgrep -x "$PRODUCT_NAME" >/dev/null && fail "could not stop the running $PRODUCT_NAME app"
+    fi
+
+    staging_dir="$(mktemp -d "$install_dir/.$PRODUCT_NAME-install.XXXXXX")"
+    staged_app="$staging_dir/$PRODUCT_NAME.app"
+    ditto "$APP_PATH" "$staged_app"
+    rm -rf "$install_path"
+    mv "$staged_app" "$install_path"
+    rmdir "$staging_dir"
+
+    open "$install_path"
+    for ((attempt = 0; attempt < 50; attempt++)); do
+        pgrep -x "$PRODUCT_NAME" >/dev/null && break
+        sleep 0.1
+    done
+    pgrep -x "$PRODUCT_NAME" >/dev/null || fail "$PRODUCT_NAME did not launch"
+    echo "Installed and launched $install_path"
+}
+
 CALLER_PWD="$PWD"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 PLIST_BUDDY=/usr/libexec/PlistBuddy
 
 APP_PATH=""
-PROJECT=""
-SCHEME=""
+PROJECT="Pace.xcodeproj"
+SCHEME="Pace"
 CONFIGURATION="Release"
 EXPECTED_VERSION=""
 EXPECTED_BUILD=""
 TEAM_ID="${TEAM_ID:-${DEVELOPMENT_TEAM:-}}"
 IDENTITY="${DEVELOPER_ID_APPLICATION:-${DEVELOPER_IDENTITY:-}}"
-NOTARY_PROFILE="${NOTARY_PROFILE:-}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-PaceNotary}"
 APPLE_ID="${APPLE_ID:-${NOTARY_APPLE_ID:-}}"
 APPLE_ID_PASSWORD="${APPLE_ID_PASSWORD:-}"
+# Keep the password available to this script without leaking it to unrelated
+# child processes. It is passed only to notarytool when seeding Keychain.
+export -n APPLE_ID_PASSWORD
 NOTARY_TIMEOUT_SECONDS="${NOTARY_TIMEOUT:-1800}"
 NOTARY_POLL_SECONDS=20
 GH_REPOSITORY="${GH_REPO:-}"
@@ -325,6 +396,7 @@ SETUP_PROFILE=""
 PUBLISH=0
 REPLACE_EXISTING=0
 SKIP_DMG_NOTARIZATION=0
+INSTALL_APP=1
 ALLOW_DIRTY=0
 KEEP_WORK_DIR=0
 DRY_RUN=0
@@ -333,7 +405,6 @@ BUILD_SETTINGS=""
 WORK_DIR=""
 HEAD_COMMIT=""
 RELEASE_EXISTS=0
-NOTARY_AUTH_MODE=""
 GH_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -405,6 +476,10 @@ while [[ $# -gt 0 ]]; do
             SKIP_DMG_NOTARIZATION=1
             shift
             ;;
+        --skip-install)
+            INSTALL_APP=0
+            shift
+            ;;
         --allow-dirty)
             ALLOW_DIRTY=1
             shift
@@ -457,17 +532,12 @@ command_exists xcodebuild
 command_exists xcrun
 [[ -x "$PLIST_BUDDY" ]] || fail "PlistBuddy not found"
 
-if [[ -z "$PROJECT" ]]; then
-    PROJECT="$(cd "$REPO_ROOT" && ls -d *.xcodeproj 2>/dev/null | head -n1 || true)"
-    [[ -n "$PROJECT" ]] || fail "no .xcodeproj found in $REPO_ROOT; run 'xcodegen generate' or pass --project"
-fi
-[[ -n "$SCHEME" ]] || SCHEME="$(basename "${PROJECT%.xcodeproj}")"
-
 case "$PROJECT" in
     /*) PROJECT_PATH="$PROJECT" ;;
     *) PROJECT_PATH="$REPO_ROOT/$PROJECT" ;;
 esac
-[[ -d "$PROJECT_PATH" ]] || fail "Xcode project not found: $PROJECT_PATH"
+[[ -d "$PROJECT_PATH" ]] || \
+    fail "Xcode project not found: $PROJECT_PATH; run 'xcodegen generate' or pass --project"
 XCODE_CONTEXT=(-project "$PROJECT_PATH" -scheme "$SCHEME" -configuration "$CONFIGURATION")
 
 if [[ -n "$SETUP_PROFILE" ]]; then
@@ -487,18 +557,7 @@ if [[ -n "$SETUP_PROFILE" ]]; then
         exit 0
     fi
 
-    if [[ -n "$APPLE_ID_PASSWORD" ]]; then
-        echo "Using APPLE_ID_PASSWORD from the environment."
-        xcrun notarytool store-credentials "$SETUP_PROFILE" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_ID_PASSWORD" \
-            --team-id "$TEAM_ID"
-    else
-        echo "notarytool will securely prompt for an app-specific password."
-        xcrun notarytool store-credentials "$SETUP_PROFILE" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$TEAM_ID"
-    fi
+    store_notary_profile "$SETUP_PROFILE"
     echo "Stored and validated notary profile '$SETUP_PROFILE'."
     echo "Use it with: NOTARY_PROFILE='$SETUP_PROFILE' scripts/publish-release.sh --publish"
     exit 0
@@ -530,16 +589,8 @@ if [[ -z "$IDENTITY" ]]; then
 fi
 [[ -n "$IDENTITY" ]] || fail "no Developer ID Application identity found for Team ID $TEAM_ID"
 
-if [[ "$SKIP_DMG_NOTARIZATION" -eq 0 ]]; then
-    if [[ -n "$NOTARY_PROFILE" ]]; then
-        NOTARY_AUTH_MODE="profile"
-    elif [[ -n "$APPLE_ID" && -n "$APPLE_ID_PASSWORD" ]]; then
-        NOTARY_AUTH_MODE="environment"
-    elif [[ -n "$APPLE_ID" || -n "$APPLE_ID_PASSWORD" ]]; then
-        fail "both APPLE_ID and APPLE_ID_PASSWORD are required for environment-based notarization"
-    else
-        fail "export APPLE_ID and APPLE_ID_PASSWORD, provide --notary-profile/NOTARY_PROFILE, or explicitly pass --skip-dmg-notarization"
-    fi
+if [[ "$SKIP_DMG_NOTARIZATION" -eq 0 && -z "$NOTARY_PROFILE" ]]; then
+    fail "--notary-profile or NOTARY_PROFILE is required; use --setup-notary-profile once, or explicitly pass --skip-dmg-notarization"
 fi
 
 case "$OUT_DIR" in
@@ -567,16 +618,19 @@ echo "  Identity:     $IDENTITY"
 echo "  Architectures: arm64 + x86_64 required"
 if [[ "$SKIP_DMG_NOTARIZATION" -eq 1 ]]; then
     echo "  DMG:          signed; notarization explicitly skipped"
-elif [[ "$NOTARY_AUTH_MODE" == "profile" ]]; then
-    echo "  DMG:          signed and notarized with profile '$NOTARY_PROFILE'"
 else
-    echo "  DMG:          signed and notarized with environment credentials"
+    echo "  DMG:          signed and notarized with profile '$NOTARY_PROFILE'"
 fi
 echo "  Output:       $OUT_DIR"
 if [[ "$PUBLISH" -eq 1 ]]; then
     echo "  GitHub:       publish $TAG${GH_REPOSITORY:+ to $GH_REPOSITORY}"
 else
     echo "  GitHub:       package only"
+fi
+if [[ "$INSTALL_APP" -eq 1 ]]; then
+    echo "  Install:      replace and launch /Applications/$PRODUCT_NAME.app"
+else
+    echo "  Install:      skipped"
 fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -588,18 +642,20 @@ for command in ditto find grep hdiutil lipo mktemp plutil shasum spctl; do
     command_exists "$command"
 done
 
+if [[ "$INSTALL_APP" -eq 1 ]]; then
+    for command in open osascript pgrep pkill; do
+        command_exists "$command"
+    done
+fi
+
 if [[ "$SKIP_DMG_NOTARIZATION" -eq 0 ]]; then
-    if [[ "$NOTARY_AUTH_MODE" == "profile" ]]; then
-        echo "Validating notary profile '$NOTARY_PROFILE'..."
-    else
-        echo "Validating notarization credentials from the environment..."
-    fi
-    notarytool_with_auth history >/dev/null || fail "notarization credentials are unavailable or invalid"
+    echo "Validating notary profile '$NOTARY_PROFILE'..."
+    ensure_notary_profile
 fi
 
 TMP_BASE="${TMPDIR:-/tmp}"
 TMP_BASE="${TMP_BASE%/}"
-WORK_DIR="$(mktemp -d "$TMP_BASE/xcode-release.XXXXXX")"
+WORK_DIR="$(mktemp -d "$TMP_BASE/pace-release.XXXXXX")"
 trap cleanup EXIT
 
 if [[ "$BUILD_FROM_SOURCE" -eq 1 ]]; then
@@ -667,7 +723,9 @@ codesign --verify --verbose=4 "$DMG_PATH"
 
 if [[ "$SKIP_DMG_NOTARIZATION" -eq 0 ]]; then
     echo "Submitting the DMG for notarization..."
-    notarytool_with_auth submit "$DMG_PATH" --wait
+    xcrun notarytool submit "$DMG_PATH" \
+        --keychain-profile "$NOTARY_PROFILE" \
+        --wait
     xcrun stapler staple "$DMG_PATH"
     xcrun stapler validate "$DMG_PATH"
     spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG_PATH"
@@ -690,16 +748,20 @@ if [[ "$PUBLISH" -eq 1 ]]; then
     if [[ "$RELEASE_EXISTS" -eq 1 ]]; then
         gh release upload "$TAG" \
             "$ZIP_PATH" "$DMG_PATH" "$OUT_DIR/$CHECKSUM_NAME" \
-            --clobber ${GH_ARGS[@]+"${GH_ARGS[@]}"}
+            --clobber "${GH_ARGS[@]}"
     else
         gh release create "$TAG" \
             "$ZIP_PATH" "$DMG_PATH" "$OUT_DIR/$CHECKSUM_NAME" \
             --target "$HEAD_COMMIT" \
             --title "$PRODUCT_NAME $VERSION" \
             --generate-notes \
-            ${GH_ARGS[@]+"${GH_ARGS[@]}"}
+            "${GH_ARGS[@]}"
     fi
 
-    RELEASE_URL="$(gh release view "$TAG" ${GH_ARGS[@]+"${GH_ARGS[@]}"} --json url --jq .url)"
+    RELEASE_URL="$(gh release view "$TAG" "${GH_ARGS[@]}" --json url --jq .url)"
     echo "Published GitHub Release $TAG: $RELEASE_URL"
+fi
+
+if [[ "$INSTALL_APP" -eq 1 ]]; then
+    install_and_launch_app
 fi

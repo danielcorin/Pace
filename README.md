@@ -126,35 +126,53 @@ swift scripts/generate-icons.swift
 
 ## Publishing a release
 
-The release workflow follows the same signing approach as
-[Reco](https://github.com/danielcorin/Reco) and
-[Mo](https://github.com/danielcorin/Mo). Signing details stay in the ignored
-`Configuration/Local.xcconfig` or come from environment variables; no
-credentials live in the repository.
+The release script reads the version, build number, bundle ID, and signing team
+from the resolved Pace app target. Signing details come from the release
+environment or the ignored `Configuration/Local.xcconfig`; no Apple
+credentials are stored in the repository. The workflow follows
+[Reco](https://github.com/danielcorin/Reco).
 
-For a non-interactive notarized build, copy the environment template and fill
-in the ignored `.env` (`APPLE_ID`, `APPLE_ID_PASSWORD`, `TEAM_ID`):
+Copy the release environment template, fill in your Apple credentials and
+GitHub repository, then allow direnv:
 
 ```sh
 cp .env.example .env
 $EDITOR .env
+direnv allow
 ```
 
-As a Keychain-based alternative, run
-`scripts/publish-release.sh --setup-notary-profile PaceNotary` once, then
-publish with `NOTARY_PROFILE=PaceNotary`.
+The ignored `.env` uses `APPLE_ID`, `APPLE_ID_PASSWORD`, `TEAM_ID`, and
+optionally `DEVELOPER_ID_APPLICATION`. On the first release, the script
+validates those values and stores the app-specific password in the
+`PaceNotary` Keychain profile. Later releases reuse that profile.
+`NOTARY_PROFILE` defaults to `PaceNotary`; the older `NOTARY_APPLE_ID`,
+`DEVELOPER_IDENTITY`, and `DEVELOPMENT_TEAM` names remain supported. You can
+also create the profile explicitly:
+
+```sh
+scripts/publish-release.sh --setup-notary-profile PaceNotary
+```
 
 Before a release, update `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in
-`project.yml`, regenerate the project, then commit and push. Run:
+`project.yml`, regenerate the project, then commit and push those changes. Run:
 
 ```sh
 scripts/publish-release.sh --dry-run    # inspect the release plan
 scripts/publish-release.sh --publish    # build, notarize, and publish
 ```
 
-The script creates a Developer ID archive, waits for Apple notarization,
-produces stapled ZIP and DMG artifacts, writes checksums, and creates the
-GitHub release.
+The publish command requires a clean branch synchronized with its upstream. It
+creates a universal Developer ID archive, uploads it through the Xcode account
+configured on the Mac, waits for Apple notarization, exports and verifies the
+stapled app, creates ZIP and DMG artifacts, separately notarizes and staples
+the outer DMG, verifies SHA-256 checksums, and uploads all three artifacts to a
+GitHub Release. It then replaces `/Applications/Pace.app` with the verified app
+and launches it.
+
+Use `--skip-install` to leave the installed app untouched. Passing an existing
+notarized `.app` path skips the archive and app-notarization stages.
+`--skip-dmg-notarization` is an explicit exception for private testing and is
+not recommended for public releases.
 
 ## Privacy and permissions
 
