@@ -83,7 +83,11 @@ targets:
       base:
         PRODUCT_NAME: pace
         PRODUCT_MODULE_NAME: PaceCommand
-        SKIP_INSTALL: "NO"
+        # The CLI ships inside Pace.app/Contents/Helpers via the embed script,
+        # which copies from BUILT_PRODUCTS_DIR. Installing it into the archive
+        # as well would put a second product beside the app, turning the
+        # archive generic — and -exportArchive rejects generic archives.
+        SKIP_INSTALL: "YES"
 
   PaceTests:
     type: bundle.unit-test
