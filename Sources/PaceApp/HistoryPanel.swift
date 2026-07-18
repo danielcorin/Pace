@@ -32,12 +32,10 @@ private enum PanelMetrics {
     static let listWidth: CGFloat = 300
     static let cornerRadius: CGFloat = 16
     static let searchHeight: CGFloat = 44
-    static let footerHeight: CGFloat = 30
     static let dividerHeight: CGFloat = 1
     static let listUnitHeight: CGFloat = 48
     static let minimumVisibleUnits = 5
     static let maximumVisibleUnits = 8
-    static let pinnedSectionHeaderClearance = listUnitHeight
 
     static func visibleUnitCount(contentUnitCount: Int) -> Int {
         min(
@@ -49,35 +47,9 @@ private enum PanelMetrics {
     static func preferredHeight(contentUnitCount: Int) -> CGFloat {
         let visibleUnits = visibleUnitCount(contentUnitCount: contentUnitCount)
         return searchHeight
-            + footerHeight
-            + dividerHeight * 2
+            + dividerHeight
             + CGFloat(visibleUnits) * listUnitHeight
     }
-}
-
-private func historyDateBucketTitle(for date: Date, now: Date = Date()) -> String {
-    let calendar = Calendar.current
-    if calendar.isDateInToday(date) { return "Today" }
-    if calendar.isDateInYesterday(date) { return "Yesterday" }
-    if calendar.isDate(date, equalTo: now, toGranularity: .weekOfYear) { return "This Week" }
-    if calendar.isDate(date, equalTo: now, toGranularity: .month) { return "This Month" }
-    if calendar.isDate(date, equalTo: now, toGranularity: .year) {
-        return date.formatted(.dateTime.month(.wide))
-    }
-    return date.formatted(.dateTime.month(.wide).year())
-}
-
-private func historyDateSectionCount(in records: [ClipboardRecord]) -> Int {
-    var count = 0
-    var previousTitle: String?
-    for record in records {
-        let title = historyDateBucketTitle(for: record.lastCopiedAt)
-        if title != previousTitle {
-            count += 1
-            previousTitle = title
-        }
-    }
-    return count
 }
 
 @MainActor
@@ -114,9 +86,7 @@ final class HistoryPanelCoordinator {
         let panel = panel ?? makePanel()
         self.panel = panel
         resizePanel(
-            to: PanelMetrics.preferredHeight(
-                contentUnitCount: model.records.count + historyDateSectionCount(in: model.records)
-            )
+            to: PanelMetrics.preferredHeight(contentUnitCount: model.records.count)
         )
         position(panel)
         NSApp.activate(ignoringOtherApps: true)
@@ -145,10 +115,7 @@ final class HistoryPanelCoordinator {
                 origin: .zero,
                 size: CGSize(
                     width: PanelMetrics.width,
-                    height: PanelMetrics.preferredHeight(
-                        contentUnitCount: model.records.count
-                            + historyDateSectionCount(in: model.records)
-                    )
+                    height: PanelMetrics.preferredHeight(contentUnitCount: model.records.count)
                 )
             ),
             styleMask: [.borderless],
@@ -247,12 +214,6 @@ final class HistoryPanelCoordinator {
 struct HistoryView: View {
     private static let deletionAnimationDuration = 0.16
 
-    private enum SelectionScrollDirection {
-        case upward
-        case downward
-        case unchanged
-    }
-
     private struct PendingDeletion {
         let deletedID: UUID
         let replacementID: UUID?
@@ -265,7 +226,6 @@ struct HistoryView: View {
     @State private var lastQuery = ""
     @State private var pendingDeletion: PendingDeletion?
     @State private var deletionSelectionTransferScheduled = false
-    @State private var lastRevealedSelection: UUID?
     @State private var shortcutKeyMonitor: Any?
     @StateObject private var listScroll = ScrollViewHandle()
 
@@ -276,7 +236,7 @@ struct HistoryView: View {
     var onPreferredHeightChange: (CGFloat) -> Void
 
     private var listContentUnitCount: Int {
-        model.records.count + (showsDateSectionHeaders ? recordSections.count : 0)
+        model.records.count
     }
 
     private var visibleListUnitCount: Int {
@@ -299,7 +259,14 @@ struct HistoryView: View {
             }
         }
         .frame(width: PanelMetrics.width, height: preferredPanelHeight)
-        .background(.thickMaterial)
+        .background {
+            ZStack {
+                PanelBackdrop(cornerRadius: PanelMetrics.cornerRadius)
+                // Mostly-opaque wash so a bright backdrop can't dilute the
+                // panel; the sliver of vibrancy left keeps it feeling native.
+                Color(nsColor: .windowBackgroundColor).opacity(0.55)
+            }
+        }
         .clipShape(RoundedRectangle(cornerRadius: PanelMetrics.cornerRadius, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: PanelMetrics.cornerRadius, style: .continuous)
@@ -353,41 +320,33 @@ struct HistoryView: View {
         } ?? model.records.first
     }
 
-    private struct RecordEntry: Identifiable {
-        let offset: Int
+    private struct NumberedSlot {
+        let number: Int
+        let index: Int
         let record: ClipboardRecord
-        var id: UUID { record.id }
     }
 
-    private struct RecordSection: Identifiable {
-        let id: Int
-        let title: String
-        var entries: [RecordEntry]
-    }
-
-    // Consecutive records sharing a date bucket form a section. Headings are
-    // only shown while browsing — text search results are relevance-ordered,
-    // so chronological headings would interleave.
-    private var recordSections: [RecordSection] {
-        let grouped = showsDateSectionHeaders
-        var sections: [RecordSection] = []
-        for (index, record) in model.records.enumerated() {
-            let title = grouped ? historyDateBucketTitle(for: record.lastCopiedAt) : ""
-            if let last = sections.indices.last, sections[last].title == title {
-                sections[last].entries.append(RecordEntry(offset: index, record: record))
-            } else {
-                sections.append(RecordSection(
-                    id: sections.count,
-                    title: title,
-                    entries: [RecordEntry(offset: index, record: record)]
-                ))
-            }
+    // ⌘1…⌘9 belong to on-screen slots rather than to records: scrolling
+    // hands each number to whichever row crosses its slot's center, making
+    // the pick a purely visual one. Every row is one fixed-height unit, so
+    // the list is an exact grid and any scroll offset maps back to the
+    // record occupying each slot.
+    private var numberedVisibleSlots: [NumberedSlot] {
+        let records = model.records
+        guard !records.isEmpty else { return [] }
+        let unitHeight = PanelMetrics.listUnitHeight
+        let offset = max(listScroll.scrollOffset, 0)
+        // The row occupying the majority of the top slot.
+        let baseIndex = Int(((offset + unitHeight / 2) / unitHeight).rounded(.down))
+        var numbered: [NumberedSlot] = []
+        for slot in 0..<visibleListUnitCount {
+            let number = slot + 1
+            guard number <= 9 else { break }
+            let index = baseIndex + slot
+            guard index >= 0, index < records.count else { break }
+            numbered.append(NumberedSlot(number: number, index: index, record: records[index]))
         }
-        return sections
-    }
-
-    private var showsDateSectionHeaders: Bool {
-        SearchQuery(model.query).text.isEmpty
+        return numbered
     }
 
     private var historyView: some View {
@@ -436,10 +395,6 @@ struct HistoryView: View {
                     DetailPane(record: selectedRecord)
                 }
             }
-
-            Divider()
-                .frame(height: PanelMetrics.dividerHeight)
-            footer
         }
         .overlay {
             Button("") { moveSelection(1) }
@@ -484,133 +439,79 @@ struct HistoryView: View {
     }
 
     private var recordList: some View {
-        ScrollViewReader { proxy in
-            // Selection is tracked manually (arrow keys + clicks) so the row
-            // highlight can be a translucent accent wash instead of the
-            // system's solid selection color.
-            ScrollView {
-                LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
-                    ForEach(recordSections) { section in
-                        if section.title.isEmpty {
-                            ForEach(section.entries) { entry in
-                                listRow(
-                                    entry.record,
-                                    number: entry.offset < 9 ? entry.offset + 1 : nil
-                                )
-                            }
-                        } else {
-                            Section {
-                                ForEach(section.entries) { entry in
-                                    listRow(
-                                        entry.record,
-                                        number: entry.offset < 9 ? entry.offset + 1 : nil
-                                    )
-                                }
-                            } header: {
-                                Text(section.title)
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 14)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .frame(height: PanelMetrics.listUnitHeight)
-                                    .background(.thickMaterial)
-                            }
-                        }
-                    }
+        // Selection is tracked manually (arrow keys + clicks) so the row
+        // highlight can be a translucent accent wash instead of the
+        // system's solid selection color.
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(model.records, id: \.id) { record in
+                    listRow(record)
                 }
             }
-            .animation(
-                pendingDeletion == nil
-                    ? nil
-                    : .easeOut(duration: Self.deletionAnimationDuration),
-                value: model.records.map(\.id)
-            )
-            .onChange(of: selection) { selected in
-                if let selected { revealSelection(selected, with: proxy) }
-            }
-            // Insertions shift rows under a preserved pixel offset, leaving
-            // the viewport clipped mid-row; re-anchor it on the selection
-            // after the new layout settles.
-            .onChange(of: model.records) { _ in
-                guard let selection else { return }
-                DispatchQueue.main.async {
-                    revealSelection(selection, with: proxy)
-                }
+            .background(OverlayScrollerStyle(handle: listScroll))
+        }
+        .animation(
+            pendingDeletion == nil
+                ? nil
+                : .easeOut(duration: Self.deletionAnimationDuration),
+            value: model.records.map(\.id)
+        )
+        .overlay(alignment: .topTrailing) { shortcutBadgeRail }
+        .onChange(of: selection) { selected in
+            if let selected { revealSelection(selected) }
+        }
+        // Insertions shift rows under a preserved pixel offset, leaving
+        // the viewport clipped mid-row; re-anchor it on the selection
+        // after the new layout settles.
+        .onChange(of: model.records) { _ in
+            guard let selection else { return }
+            DispatchQueue.main.async {
+                revealSelection(selection)
             }
         }
     }
 
-    // Prefer one direct, minimal AppKit adjustment for ordinary arrow-key
-    // movement. SwiftUI's scrollTo followed by an AppKit correction produces
-    // a visible down-then-up flicker at the viewport edge. A directional proxy
-    // scroll is only needed when LazyVStack has not materialized the target.
-    private func revealSelection(_ id: UUID, with proxy: ScrollViewProxy) {
+    // The ⌘-number badges live in an overlay on the viewport, not inside the
+    // lazy rows, so a recycled lazy row can never show a stale or missing
+    // number. Each badge sits at its row's actual position — riding along
+    // mid-scroll — and hops to the next row when that row claims the slot.
+    private var shortcutBadgeRail: some View {
+        ZStack(alignment: .topTrailing) {
+            ForEach(numberedVisibleSlots, id: \.number) { numbered in
+                Text("⌘\(numbered.number)")
+                    .font(.system(size: 10, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .frame(height: PanelMetrics.listUnitHeight)
+                    .offset(
+                        y: CGFloat(numbered.index) * PanelMetrics.listUnitHeight
+                            - listScroll.scrollOffset
+                    )
+            }
+        }
+        .padding(.trailing, 14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+        .clipped()
+        .allowsHitTesting(false)
+    }
+
+    // Arrow-key movement scrolls the AppKit scroll view directly: the fixed
+    // unit grid makes the target offset exact math, independent of which rows
+    // LazyVStack has materialized, and avoids the down-then-up flicker of
+    // scrollTo followed by a correction.
+    private func revealSelection(_ id: UUID) {
         // A records update may have queued work for a selection that rapid
         // key repeat has already moved past.
         guard selection == id else { return }
-
-        let direction = selectionScrollDirection(to: id)
-        lastRevealedSelection = id
-
-        if id == model.records.first?.id {
-            // Anchoring the first row via ScrollViewProxy scrolls the
-            // scroll view's own top inset out of view.
-            listScroll.scrollToTop()
-            return
-        }
-
-        let topClearance = showsDateSectionHeaders
-            ? PanelMetrics.pinnedSectionHeaderClearance
-            : 0
-        guard !listScroll.ensureRowIsVisible(id, topClearance: topClearance) else {
-            return
-        }
-
-        // Large or very rapid selection jumps can outrun LazyVStack's
-        // materialized views. Anchor the target at the edge it entered from
-        // so key repeat never pulls the selection into the middle.
-        proxy.scrollTo(id, anchor: fallbackScrollAnchor(for: direction))
+        guard let index = model.records.firstIndex(where: { $0.id == id }) else { return }
+        listScroll.scrollUnitIntoView(index, unitHeight: PanelMetrics.listUnitHeight)
     }
 
-    private func selectionScrollDirection(to id: UUID) -> SelectionScrollDirection {
-        guard let previousID = lastRevealedSelection,
-              let previousIndex = model.records.firstIndex(where: { $0.id == previousID }),
-              let nextIndex = model.records.firstIndex(where: { $0.id == id }) else {
-            return .unchanged
-        }
-        if nextIndex > previousIndex { return .downward }
-        if nextIndex < previousIndex { return .upward }
-        return .unchanged
-    }
-
-    private func fallbackScrollAnchor(for direction: SelectionScrollDirection) -> UnitPoint {
-        switch direction {
-        case .downward:
-            return .bottom
-        case .upward:
-            guard showsDateSectionHeaders else { return .top }
-            // ScrollViewProxy aligns the same unit point in the row and
-            // viewport. This fraction places the row's top exactly one
-            // 48-point unit below the pinned date header.
-            let y = 1 / CGFloat(max(visibleListUnitCount - 1, 1))
-            return UnitPoint(x: 0.5, y: y)
-        case .unchanged:
-            return .center
-        }
-    }
-
-    private func listRow(_ record: ClipboardRecord, number: Int?) -> some View {
-        ClipboardRow(record: record, shortcutNumber: number)
-            .padding(.horizontal, 12)
+    private func listRow(_ record: ClipboardRecord) -> some View {
+        ClipboardRow(record: record)
+            .padding(.leading, 12)
+            .padding(.trailing, 44)
             .frame(maxWidth: .infinity)
             .frame(height: PanelMetrics.listUnitHeight)
-            .id(record.id)
-            .background(
-                OverlayScrollerStyle(
-                    handle: listScroll,
-                    rowID: record.id
-                )
-            )
             .background(
                 // Primary at low opacity reads as a neutral gray wash in both
                 // light and dark appearances.
@@ -644,20 +545,11 @@ struct HistoryView: View {
             }
     }
 
-    private var footer: some View {
-        HStack {
-            Spacer()
-            Text("\(model.records.count) shown")
-                .foregroundStyle(.secondary)
-        }
-        .font(.caption)
-        .padding(.horizontal, 14)
-        .frame(height: 30)
-    }
-
     private func pasteNumbered(_ number: Int) {
-        guard number <= model.records.count else { return }
-        onPaste(model.records[number - 1], .original)
+        guard let numbered = numberedVisibleSlots.first(where: { $0.number == number }) else {
+            return
+        }
+        onPaste(numbered.record, .original)
     }
 
     private func moveSelection(_ delta: Int) {
@@ -807,86 +699,75 @@ struct HistoryView: View {
 }
 
 // ScrollViewProxy can only target rows (with the list's top inset applied);
-// scrolling to the list's absolute origin needs the NSScrollView itself.
+// unit-grid scrolling and the ⌘-number slot mapping need the NSScrollView
+// itself. All offsets measure from the top of the content regardless of the
+// document view's coordinate orientation.
 @MainActor
 private final class ScrollViewHandle: ObservableObject {
-    private final class WeakView {
-        weak var value: NSView?
+    // Drives the ⌘-number slot mapping; updated from clip-view bounds changes.
+    @Published private(set) var scrollOffset: CGFloat = 0
 
-        init(_ value: NSView) {
-            self.value = value
+    private(set) weak var scrollView: NSScrollView?
+    private var boundsObserver: NSObjectProtocol?
+
+    func attach(_ scrollView: NSScrollView) {
+        guard self.scrollView !== scrollView else { return }
+        self.scrollView = scrollView
+        if let boundsObserver { NotificationCenter.default.removeObserver(boundsObserver) }
+        let clipView = scrollView.contentView
+        clipView.postsBoundsChangedNotifications = true
+        boundsObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: clipView,
+            queue: nil
+        ) { [weak self] _ in
+            // Deferred: bounds changes can land mid-layout, where publishing
+            // would re-enter the SwiftUI update.
+            DispatchQueue.main.async { self?.refreshScrollOffset() }
+        }
+        refreshScrollOffset()
+    }
+
+    func scrollUnitIntoView(_ unitIndex: Int, unitHeight: CGFloat) {
+        guard let scrollView else { return }
+        let viewportHeight = scrollView.documentVisibleRect.height
+        let current = currentOffset()
+        let rowTop = CGFloat(unitIndex) * unitHeight
+        let rowBottom = rowTop + unitHeight
+        if rowTop < current {
+            scroll(toOffset: rowTop)
+        } else if rowBottom > current + viewportHeight {
+            scroll(toOffset: rowBottom - viewportHeight)
         }
     }
 
-    weak var scrollView: NSScrollView?
-    private var rowViews: [UUID: WeakView] = [:]
-
-    func register(rowView: NSView, for id: UUID) {
-        rowViews[id] = WeakView(rowView)
+    private func currentOffset() -> CGFloat {
+        guard let scrollView, let document = scrollView.documentView else { return 0 }
+        let visible = scrollView.documentVisibleRect
+        return document.isFlipped
+            ? visible.minY
+            : document.bounds.height - visible.maxY
     }
 
-    func unregister(rowView: NSView, for id: UUID) {
-        guard rowViews[id]?.value === rowView else { return }
-        rowViews[id] = nil
-    }
-
-    func scrollToTop() {
+    private func scroll(toOffset offset: CGFloat) {
         guard let scrollView, let document = scrollView.documentView else { return }
-        let origin = NSPoint(
-            x: 0,
-            y: document.isFlipped
-                ? 0
-                : document.bounds.height - scrollView.contentView.bounds.height
+        let viewportHeight = scrollView.documentVisibleRect.height
+        let clamped = min(max(offset, 0), max(0, document.bounds.height - viewportHeight))
+        guard abs(clamped - currentOffset()) > 0.5 else { return }
+        let y = document.isFlipped
+            ? clamped
+            : document.bounds.height - viewportHeight - clamped
+        scrollView.contentView.scroll(
+            to: NSPoint(x: scrollView.contentView.bounds.origin.x, y: y)
         )
-        scrollView.contentView.scroll(to: origin)
         scrollView.reflectScrolledClipView(scrollView.contentView)
+        refreshScrollOffset()
     }
 
-    @discardableResult
-    func ensureRowIsVisible(_ id: UUID, topClearance: CGFloat) -> Bool {
-        guard let rowView = rowViews[id]?.value,
-              rowView.window != nil,
-              rowView.bounds.height > 0,
-              let scrollView,
-              let document = scrollView.documentView else {
-            rowViews[id] = nil
-            return false
-        }
-
-        // Rows and section headers share one exact layout unit, so aligning
-        // the row bounds also aligns the viewport to the item grid.
-        let rowRect = rowView.convert(rowView.bounds, to: document)
-        let viewport = scrollView.documentVisibleRect
-        var targetY = viewport.origin.y
-
-        if document.isFlipped {
-            let visibleTop = viewport.minY + topClearance
-            let visibleBottom = viewport.maxY
-            if rowRect.minY < visibleTop {
-                targetY = rowRect.minY - topClearance
-            } else if rowRect.maxY > visibleBottom {
-                targetY = rowRect.maxY - viewport.height
-            }
-        } else {
-            let visibleTop = viewport.maxY - topClearance
-            let visibleBottom = viewport.minY
-            if rowRect.maxY > visibleTop {
-                targetY = rowRect.maxY + topClearance - viewport.height
-            } else if rowRect.minY < visibleBottom {
-                targetY = rowRect.minY
-            }
-        }
-
-        let minimumY = document.bounds.minY
-        let maximumY = max(minimumY, document.bounds.maxY - viewport.height)
-        targetY = min(max(targetY, minimumY), maximumY)
-        guard abs(targetY - viewport.origin.y) > 0.5 else { return true }
-
-        scrollView.contentView.scroll(
-            to: NSPoint(x: scrollView.contentView.bounds.origin.x, y: targetY)
-        )
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-        return true
+    private func refreshScrollOffset() {
+        guard scrollView != nil else { return }
+        let offset = currentOffset()
+        if abs(offset - scrollOffset) > 0.5 { scrollOffset = offset }
     }
 }
 
@@ -938,55 +819,38 @@ private struct PlainTextPreview: NSViewRepresentable {
 // finds its enclosing scroll view and switches it to overlay scrollers that
 // appear only while scrolling. The conversion happens in viewDidMoveToWindow
 // — before first paint — so the legacy scroller (and the layout gutter it
-// reserves, which would shift row content) never shows. It also reports the
-// scroll view and materialized rows back through `handle` so selection
-// movement can account for the pinned section header overlay immediately.
+// reserves, which would shift row content) never shows. It also hands the
+// scroll view to `handle` for unit-grid scrolling and the ⌘-number slot
+// mapping.
 private struct OverlayScrollerStyle: NSViewRepresentable {
     var handle: ScrollViewHandle?
-    var rowID: UUID
-
-    init(
-        handle: ScrollViewHandle? = nil,
-        rowID: UUID
-    ) {
-        self.handle = handle
-        self.rowID = rowID
-    }
 
     func makeNSView(context: Context) -> ProbeView {
         let probe = ProbeView()
         probe.handle = handle
-        probe.rowID = rowID
         return probe
     }
 
     func updateNSView(_ nsView: ProbeView, context: Context) {
-        if let previousID = nsView.rowID, previousID != rowID {
-            nsView.handle?.unregister(rowView: nsView, for: previousID)
-        }
         nsView.handle = handle
-        nsView.rowID = rowID
         nsView.applyIfAttached()
-        nsView.updateRowRegistration()
     }
 
     final class ProbeView: NSView {
         var handle: ScrollViewHandle?
-        var rowID: UUID?
         private var styleObservation: NSKeyValueObservation?
         private weak var observedScrollView: NSScrollView?
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             applyIfAttached()
-            updateRowRegistration()
         }
 
         func applyIfAttached() {
             var ancestor = superview
             while let current = ancestor, !(current is NSScrollView) { ancestor = current.superview }
             guard let scrollView = ancestor as? NSScrollView else { return }
-            handle?.scrollView = scrollView
+            handle?.attach(scrollView)
             Self.enforceOverlay(on: scrollView)
             guard observedScrollView !== scrollView else { return }
             observedScrollView = scrollView
@@ -998,20 +862,49 @@ private struct OverlayScrollerStyle: NSViewRepresentable {
             }
         }
 
-        func updateRowRegistration() {
-            guard let handle, let rowID else { return }
-            if window != nil {
-                handle.register(rowView: self, for: rowID)
-            } else {
-                handle.unregister(rowView: self, for: rowID)
-            }
-        }
-
         private static func enforceOverlay(on scrollView: NSScrollView) {
             guard scrollView.scrollerStyle != .overlay else { return }
             scrollView.scrollerStyle = .overlay
             scrollView.autohidesScrollers = true
         }
+    }
+}
+
+// A behind-window vibrancy backdrop. Unlike SwiftUI's in-window materials it
+// samples only what is behind the window, so in-window content sliding
+// beneath it (rows under a pinned header) never shows through or shifts its
+// color, and every surface using it matches the panel body exactly.
+private struct PanelBackdrop: NSViewRepresentable {
+    var cornerRadius: CGFloat = 0
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.blendingMode = .behindWindow
+        view.material = .popover
+        view.state = .active
+        if cornerRadius > 0 {
+            view.maskImage = Self.roundedMask(radius: cornerRadius)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+
+    // A layer mask does not reliably clip a behind-window blur region; the
+    // effect view's own maskImage does.
+    private static func roundedMask(radius: CGFloat) -> NSImage {
+        let edge = radius * 2 + 1
+        let image = NSImage(
+            size: NSSize(width: edge, height: edge),
+            flipped: false
+        ) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        image.resizingMode = .stretch
+        return image
     }
 }
 
@@ -1046,7 +939,6 @@ private func kindIcon(_ kind: ClipboardContentKind) -> String {
 private struct ClipboardRow: View {
     @EnvironmentObject private var model: AppModel
     let record: ClipboardRecord
-    let shortcutNumber: Int?
     @State private var thumbnail: CachedItemImage?
 
     var body: some View {
@@ -1061,11 +953,6 @@ private struct ClipboardRow: View {
                 Image(systemName: "pin.fill")
                     .font(.system(size: 9))
                     .foregroundStyle(.orange)
-            }
-            if let shortcutNumber {
-                Text("⌘\(shortcutNumber)")
-                    .font(.system(size: 10, weight: .medium).monospacedDigit())
-                    .foregroundStyle(.tertiary)
             }
         }
         .padding(.vertical, 2)
