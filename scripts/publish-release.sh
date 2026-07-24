@@ -356,9 +356,26 @@ install_and_launch_app() {
     staging_dir="$(mktemp -d "$install_dir/.$PRODUCT_NAME-install.XXXXXX")"
     staged_app="$staging_dir/$PRODUCT_NAME.app"
     ditto "$APP_PATH" "$staged_app"
+
+    # macOS binds permission grants (TCC) to the code signature. When the
+    # replaced copy was signed differently — a development build, say — its
+    # stale records silently block new permission prompts, so clear them.
+    # Same-signature updates keep their grants and must not be reset.
+    local old_requirement new_requirement service
+    old_requirement="$(codesign -d -r- "$install_path" 2>/dev/null || true)"
+    new_requirement="$(codesign -d -r- "$staged_app" 2>/dev/null || true)"
+
     rm -rf "$install_path"
     mv "$staged_app" "$install_path"
     rmdir "$staging_dir"
+
+    if [[ -n "$old_requirement" && "$old_requirement" != "$new_requirement" ]]; then
+        echo "Code signature changed; clearing stale permission records for $BUNDLE_ID..."
+        for service in Accessibility PostEvent; do
+            tccutil reset "$service" "$BUNDLE_ID" >/dev/null 2>&1 || true
+        done
+        echo "Grant $PRODUCT_NAME's permissions again from its menu bar icon."
+    fi
 
     open "$install_path"
     for ((attempt = 0; attempt < 50; attempt++)); do

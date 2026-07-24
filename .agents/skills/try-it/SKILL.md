@@ -26,19 +26,35 @@ Ship the working tree into /Applications and start the app.
      "CODE_SIGN_IDENTITY=Developer ID Application" \
      "OTHER_CODE_SIGN_FLAGS=--timestamp"
    ```
-   If `Configuration/Local.xcconfig` exists and sets `DEVELOPMENT_TEAM`, drop the
-   signing overrides and let the project settings sign.
+   Always keep these manual signing overrides. The wvlen team has no Apple
+   Development certificate, so automatic/project-settings signing silently
+   falls back to a personal-team development cert — and TCC will show the
+   Accessibility consent dialog for such a build yet never add it to the
+   Accessibility list, breaking paste onboarding. After building, confirm
+   `codesign -dvvv` reports `Authority=Developer ID Application: wvlen LLC`.
 
    If the build fails: report the failure and stop — leave the installed copy alone.
 
 4. Replace the installed app. Remove first — `ditto` merges into an existing
-   bundle, which can leave stale files behind:
+   bundle, which can leave stale files behind. macOS binds permission grants
+   (TCC) to the code signature, and a leftover record from a differently
+   signed copy silently blocks new permission prompts — compare designated
+   requirements and reset only when they differ, so same-signature reinstalls
+   keep their grants:
    ```sh
+   old_req="$(codesign -d -r- /Applications/Pace.app 2>/dev/null || true)"
+   new_req="$(codesign -d -r- build/Build/Products/Release/Pace.app 2>/dev/null || true)"
    rm -rf /Applications/Pace.app
    ditto build/Build/Products/Release/Pace.app /Applications/Pace.app
+   if [ -n "$old_req" ] && [ "$old_req" != "$new_req" ]; then
+     echo "Code signature changed; clearing stale permission records..."
+     tccutil reset Accessibility llc.wvlen.Pace || true
+     tccutil reset PostEvent llc.wvlen.Pace || true
+   fi
    ```
    Writing to /Applications is outside the workspace, so the sandboxed shell may
-   deny it — rerun that step with the sandbox disabled if so.
+   deny it — rerun that step with the sandbox disabled if so. If the reset ran,
+   tell the user to re-grant Accessibility from the Pace menu bar icon.
 
 5. Verify the signature survived the copy, then launch:
    ```sh
