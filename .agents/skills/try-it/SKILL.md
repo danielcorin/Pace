@@ -5,11 +5,14 @@ description: Builds the current Pace working tree and installs it to /Applicatio
 
 # Try It: build, install, and relaunch Pace
 
-Run the installer (from anywhere in the repo):
+Run the installer from the repo root:
 
 ```sh
 bash .agents/skills/try-it/scripts/try-it.sh
 ```
+
+(The script may also be invoked by absolute path from any directory — it
+resolves the repo root itself.)
 
 The script regenerates the Xcode project if `project.yml` changed, builds
 Release with manual Developer ID signing, quits any running copy, atomically
