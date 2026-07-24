@@ -48,6 +48,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var capturePausedUntil: Date?
     @Published var statusMessage: String?
     @Published private(set) var launchesAtLogin = SMAppService.mainApp.status == .enabled
+    @Published private(set) var hasAccessibilityAccess = AXIsProcessTrusted()
+    @Published private(set) var hasPromptedForAccessibility = false
 
     private let store: HistoryStore
     private let keyStore = VaultKeyStore()
@@ -81,6 +83,7 @@ final class AppModel: ObservableObject {
     }
 
     func start() {
+        refreshPermissions()
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers.append(
             center.addObserver(
@@ -339,6 +342,57 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func refreshPermissions() {
+        // AXIsProcessTrusted always checks this process. The CG preflight
+        // (CGPreflightPostEventAccess) rides the current event's provenance,
+        // so a check triggered from a Karabiner-synthesized keystroke is
+        // evaluated against Karabiner — and reports access Pace doesn't have.
+        hasAccessibilityAccess = AXIsProcessTrusted()
+    }
+
+    func requestAccessibilityAccess() {
+        refreshPermissions()
+        guard !hasAccessibilityAccess else { return }
+
+        // The consent dialog registers Pace in the Accessibility list and has
+        // its own "Open System Settings" button, so the first request lets
+        // the dialog drive — opening the pane from here as well races the
+        // dialog. macOS shows the dialog at most once per launch (and never
+        // after a denial); repeat requests open the pane directly instead.
+        guard !hasPromptedForAccessibility else {
+            openAccessibilitySettings()
+            return
+        }
+        hasPromptedForAccessibility = true
+
+        // On older macOS the prompt also registers the app in the
+        // Accessibility list; current releases refuse prompt-based
+        // registration ("Service kTCCServiceAccessibility does not allow
+        // prompting") and only show an informational dialog, so the pane's
+        // add button is the real path and the menu explains it.
+        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        _ = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+
+        // The grant lands while the user works the dialog and Settings pane;
+        // poll so the menu reflects it without another click.
+        Task { [weak self] in
+            for _ in 0..<120 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                self.refreshPermissions()
+                if self.hasAccessibilityAccess { return }
+            }
+        }
+    }
+
+    private func openAccessibilitySettings() {
+        let anchor = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        if let url = URL(string: anchor), NSWorkspace.shared.open(url) { return }
+        NSWorkspace.shared.open(
+            URL(fileURLWithPath: "/System/Applications/System Settings.app")
+        )
+    }
+
     func handle(_ request: IPCRequest) async -> IPCResponse {
         do {
             switch request.command {
@@ -531,10 +585,10 @@ final class AppModel: ObservableObject {
         into target: NSRunningApplication?,
         imageContent: Bool = false
     ) async throws {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        guard AXIsProcessTrustedWithOptions(options) else {
+        refreshPermissions()
+        guard hasAccessibilityAccess else {
             throw PaceError.unavailable(
-                "Enable Pace in System Settings → Privacy & Security → Accessibility to paste directly. The item is still on your clipboard."
+                "Grant Accessibility access from the Pace menu bar icon to paste directly. The item is still on your clipboard."
             )
         }
 

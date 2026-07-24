@@ -102,7 +102,23 @@ private struct MenuBarContent: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
+        if !model.hasAccessibilityAccess {
+            Text("Accessibility access is needed to paste")
+            Button(
+                model.hasPromptedForAccessibility
+                    ? "Open Accessibility Settings…"
+                    : "Grant Access…"
+            ) {
+                model.requestAccessibilityAccess()
+            }
+            if model.hasPromptedForAccessibility {
+                Text("If Pace isn't listed, add /Applications/Pace.app with the + button")
+            }
+            Divider()
+        }
+
         Button("Show Pace") { AppRuntime.shared.showPanel() }
+            .onAppear { model.refreshPermissions() }
 
         Divider()
 
