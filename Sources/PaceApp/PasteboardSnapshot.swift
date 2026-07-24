@@ -201,17 +201,6 @@ extension ClipboardItem {
             }
             return item
         }
-        // Text-only targets (terminal prompts, Raycast-style fields) can't
-        // take image data, and some let the synthesized ⌘V fall through as a
-        // literal "v" keystroke. Give them the OCR text as a plain-text
-        // representation; image-capable apps still prefer the image types
-        // written first.
-        if kind == .image,
-           !representations.contains(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue }),
-           let ocrText,
-           let first = items.first {
-            first.setString(ocrText, forType: .string)
-        }
         pasteboard.writeObjects(items)
     }
 }
