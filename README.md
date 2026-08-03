@@ -207,12 +207,13 @@ mise exec -- scripts/publish-release.sh --publish    # build, notarize, and publ
 ```
 
 The publish command requires a clean branch synchronized with its upstream. It
-creates a universal Developer ID archive, uploads it through the Xcode account
-configured on the Mac, waits for Apple notarization, exports and verifies the
-stapled app, creates ZIP and DMG artifacts, separately notarizes and staples
+creates a universal archive, signs the app and embedded CLI with Developer ID,
+submits the app directly with the configured `notarytool` profile, staples and
+verifies it, creates ZIP and DMG artifacts, separately notarizes and staples
 the outer DMG, verifies SHA-256 checksums, and uploads all three artifacts to a
 GitHub Release. It then replaces `/Applications/Pace.app` with the verified app
-and launches it.
+and launches it. This flow does not require an Apple account to be logged into
+Xcode.
 
 Use `--skip-install` to leave the installed app untouched. Passing an existing
 notarized `.app` path skips the archive and app-notarization stages.
