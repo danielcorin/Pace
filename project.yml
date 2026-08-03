@@ -50,6 +50,7 @@ targets:
     dependencies:
       - target: PaceCore
       - target: PaceCLI
+        embed: false
     settings:
       base:
         PRODUCT_NAME: Pace

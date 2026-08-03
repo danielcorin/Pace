@@ -296,9 +296,11 @@ verify_app() {
 
 sign_and_notarize_app() {
     local helper_path="$APP_PATH/Contents/Helpers/pace"
+    local legacy_helper_path="$APP_PATH/Contents/Resources/pace"
     local upload_path="$WORK_DIR/$PRODUCT_NAME-$VERSION-notarization.zip"
 
     [[ -x "$helper_path" ]] || fail "embedded CLI not found: $helper_path"
+    [[ ! -e "$legacy_helper_path" ]] || fail "unexpected duplicate CLI found: $legacy_helper_path"
 
     echo "Developer ID-signing the embedded CLI and app..."
     codesign --force --options runtime --timestamp --sign "$IDENTITY" "$helper_path"
