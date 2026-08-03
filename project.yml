@@ -2,7 +2,7 @@ name: Pace
 
 # XcodeGen spec. This YAML is the source of truth for the Xcode project;
 # the generated .xcodeproj is disposable (git-ignored). Regenerate with:
-#   xcodegen generate
+#   mise exec -- xcodegen generate
 
 options:
   deploymentTarget:
@@ -19,8 +19,8 @@ configFiles:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.2.0"
-    CURRENT_PROJECT_VERSION: "3"
+    MARKETING_VERSION: "1.3.0"
+    CURRENT_PROJECT_VERSION: "4"
     CODE_SIGN_STYLE: Automatic
     ENABLE_HARDENED_RUNTIME: "YES"      # required for notarization
     GENERATE_INFOPLIST_FILE: "YES"
@@ -56,6 +56,7 @@ targets:
         COMBINE_HIDPI_IMAGES: "YES"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_KEY_LSUIElement: "YES"
+        INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.productivity"
         INFOPLIST_KEY_NSPrincipalClass: NSApplication
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
     postBuildScripts:

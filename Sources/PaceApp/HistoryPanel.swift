@@ -10,6 +10,7 @@ private final class PacePanel: NSPanel {
 extension Notification.Name {
     static let paceHistoryPanelDidShow = Notification.Name("PaceHistoryPanelDidShow")
     static let paceOpenSettings = Notification.Name("PaceOpenSettings")
+    static let pacePanelEscapePressed = Notification.Name("PacePanelEscapePressed")
 }
 
 // Relays ⌘, from the panel's key monitor to the openSettings environment
@@ -24,6 +25,31 @@ private struct SettingsShortcutBridge: View {
                 NSApp.activate(ignoringOtherApps: true)
                 openSettings()
             }
+    }
+}
+
+private struct SnippetEditorDraft: Equatable {
+    var snippet: Snippet
+    var tagsText: String
+    var isNew: Bool
+
+    init(snippet: Snippet, isNew: Bool = false) {
+        self.snippet = snippet
+        tagsText = snippet.tags.joined(separator: ", ")
+        self.isNew = isNew
+    }
+
+    var resolvedSnippet: Snippet {
+        var resolved = snippet
+        let keyword = snippet.keyword?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let placeholderPrefix = SnippetExpansionPreferences.defaultPrefix
+        resolved.keyword = keyword.isEmpty || keyword == placeholderPrefix ? nil : keyword
+        resolved.isExpansionEnabled = resolved.keyword != nil && snippet.isExpansionEnabled
+        resolved.tags = tagsText
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return resolved
     }
 }
 
@@ -67,13 +93,14 @@ final class HistoryPanelCoordinator {
 
     var isVisible: Bool { panel?.isVisible == true }
 
-    func toggle() {
-        if isVisible { hide() }
-        else { show() }
+    func toggle(scope: PacePanelScope) {
+        if isVisible, model.panelScope == scope { hide() }
+        else { show(scope: scope) }
     }
 
-    func show() {
+    func show(scope: PacePanelScope = .clipboard) {
         wantsVisible = true
+        model.panelScope = scope
         let frontmost = NSWorkspace.shared.frontmostApplication
         if frontmost?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             targetApplication = frontmost
@@ -86,7 +113,9 @@ final class HistoryPanelCoordinator {
         let panel = panel ?? makePanel()
         self.panel = panel
         resizePanel(
-            to: PanelMetrics.preferredHeight(contentUnitCount: model.records.count)
+            to: PanelMetrics.preferredHeight(
+                contentUnitCount: scope == .clipboard ? model.records.count : model.snippets.count
+            )
         )
         position(panel)
         NSApp.activate(ignoringOtherApps: true)
@@ -103,6 +132,7 @@ final class HistoryPanelCoordinator {
         wantsVisible = false
         panel?.orderOut(nil)
         model.query = ""
+        model.snippetQuery = ""
     }
 
     private func makePanel() -> PacePanel {
@@ -143,7 +173,7 @@ final class HistoryPanelCoordinator {
         // only fires when the focused view routes the cancel action to it.
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, event.keyCode == 53, self.panel?.isKeyWindow == true else { return event }
-            self.hide()
+            NotificationCenter.default.post(name: .pacePanelEscapePressed, object: nil)
             return nil
         }
 
@@ -158,6 +188,17 @@ final class HistoryPanelCoordinator {
                 guard let self else { return }
                 self.hide()
                 Task { await self.model.copy(record, mode: mode) }
+            },
+            onPasteSnippet: { [weak self] snippet in
+                guard let self else { return }
+                let target = self.targetApplication
+                self.hide()
+                Task { await self.model.pasteSnippet(snippet, into: target) }
+            },
+            onCopySnippet: { [weak self] snippet in
+                guard let self else { return }
+                self.hide()
+                Task { await self.model.copySnippet(snippet) }
             },
             onUnlock: { [weak self] in self?.unlockAndRestorePanel() },
             onClose: { [weak self] in self?.hide() },
@@ -219,6 +260,11 @@ struct HistoryView: View {
         let replacementID: UUID?
     }
 
+    private struct PendingSnippetConfiguration {
+        let snippet: Snippet
+        let prefillKeyword: Bool
+    }
+
     @EnvironmentObject private var model: AppModel
     @FocusState private var searchFocused: Bool
     @State private var selection: UUID?
@@ -227,16 +273,29 @@ struct HistoryView: View {
     @State private var pendingDeletion: PendingDeletion?
     @State private var deletionSelectionTransferScheduled = false
     @State private var shortcutKeyMonitor: Any?
+    @State private var snippetSelection: UUID?
+    @State private var lastSnippetFirstID: UUID?
+    @State private var lastSnippetQuery = ""
+    @State private var snippetEditorDraft: SnippetEditorDraft?
+    @State private var snippetEditorError: String?
+    @State private var pendingSnippetConfiguration: PendingSnippetConfiguration?
     @StateObject private var listScroll = ScrollViewHandle()
+    @StateObject private var snippetListScroll = ScrollViewHandle()
 
     var onPaste: (ClipboardRecord, ClipboardRestoreMode) -> Void
     var onCopy: (ClipboardRecord, ClipboardRestoreMode) -> Void
+    var onPasteSnippet: (Snippet) -> Void
+    var onCopySnippet: (Snippet) -> Void
     var onUnlock: () -> Void
     var onClose: () -> Void
     var onPreferredHeightChange: (CGFloat) -> Void
 
     private var listContentUnitCount: Int {
-        model.records.count
+        if snippetEditorDraft != nil { return PanelMetrics.maximumVisibleUnits }
+        switch model.panelScope {
+        case .clipboard: return model.records.count
+        case .snippets: return model.snippets.count
+        }
     }
 
     private var visibleListUnitCount: Int {
@@ -255,7 +314,7 @@ struct HistoryView: View {
             case .failed(let message):
                 failedView(message)
             case .unlocked:
-                historyView
+                unlockedView
             }
         }
         .frame(width: PanelMetrics.width, height: preferredPanelHeight)
@@ -279,6 +338,21 @@ struct HistoryView: View {
             }
         }
         .onExitCommand(perform: onClose)
+        .onReceive(NotificationCenter.default.publisher(for: .pacePanelEscapePressed)) { _ in
+            if snippetEditorDraft != nil {
+                cancelSnippetEditor()
+            } else {
+                onClose()
+            }
+        }
+        .onChange(of: model.panelScope) { scope in
+            if scope == .snippets, pendingSnippetConfiguration != nil {
+                presentPendingSnippetConfiguration()
+            } else {
+                cancelSnippetEditor()
+            }
+            DispatchQueue.main.async { searchFocused = snippetEditorDraft == nil }
+        }
         .onAppear {
             onPreferredHeightChange(preferredPanelHeight)
         }
@@ -320,10 +394,21 @@ struct HistoryView: View {
         } ?? model.records.first
     }
 
+    private var selectedSnippet: Snippet? {
+        snippetSelection.flatMap { id in model.snippets.first { $0.id == id } }
+            ?? model.snippets.first
+    }
+
     private struct NumberedSlot {
         let number: Int
         let index: Int
         let record: ClipboardRecord
+    }
+
+    private struct NumberedSnippetSlot {
+        let number: Int
+        let index: Int
+        let snippet: Snippet
     }
 
     // ⌘1…⌘9 belong to on-screen slots rather than to records: scrolling
@@ -349,9 +434,36 @@ struct HistoryView: View {
         return numbered
     }
 
-    private var historyView: some View {
+    private var numberedVisibleSnippetSlots: [NumberedSnippetSlot] {
+        let snippets = model.snippets
+        guard !snippets.isEmpty else { return [] }
+        let unitHeight = PanelMetrics.listUnitHeight
+        let offset = max(snippetListScroll.scrollOffset, 0)
+        let baseIndex = Int(((offset + unitHeight / 2) / unitHeight).rounded(.down))
+        var numbered: [NumberedSnippetSlot] = []
+        for slot in 0..<visibleListUnitCount {
+            let number = slot + 1
+            guard number <= 9 else { break }
+            let index = baseIndex + slot
+            guard index >= 0, index < snippets.count else { break }
+            numbered.append(NumberedSnippetSlot(number: number, index: index, snippet: snippets[index]))
+        }
+        return numbered
+    }
+
+    @ViewBuilder
+    private var unlockedView: some View {
+        switch model.panelScope {
+        case .clipboard: clipboardView
+        case .snippets: snippetsView
+        }
+    }
+
+    private var clipboardView: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
+                scopePicker
+                Divider().frame(height: 18)
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                 ZStack(alignment: .leading) {
                     // The field's own placeholder is drawn by the cell when
@@ -392,7 +504,16 @@ struct HistoryView: View {
                     recordList
                         .frame(width: PanelMetrics.listWidth)
                     Divider()
-                    DetailPane(record: selectedRecord)
+                    if snippetEditorDraft != nil {
+                        snippetEditorPane
+                    } else {
+                        DetailPane(
+                            record: selectedRecord,
+                            derivedSnippet: selectedRecord.flatMap(model.snippetDerived),
+                            onSaveAsSnippet: { beginPromotion($0) },
+                            onOpenSnippet: openSnippet
+                        )
+                    }
                 }
             }
         }
@@ -422,6 +543,235 @@ struct HistoryView: View {
             selectFirstIfNeeded()
         }
         .onChange(of: model.records) { _ in recordsDidChange() }
+    }
+
+    private var scopePicker: some View {
+        Menu {
+            ForEach(PacePanelScope.allCases) { scope in
+                Button {
+                    model.panelScope = scope
+                } label: {
+                    Label(scope.title, systemImage: scope.systemImage)
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: model.panelScope.systemImage)
+                Text(model.panelScope.title)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .disabled(snippetEditorDraft != nil)
+    }
+
+    private var snippetsView: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                scopePicker
+                Divider().frame(height: 18)
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                ZStack(alignment: .leading) {
+                    if model.snippetQuery.isEmpty {
+                        Text("Search snippets")
+                            .font(.system(size: 15))
+                            .foregroundStyle(Color(nsColor: .placeholderTextColor))
+                            .allowsHitTesting(false)
+                    }
+                    TextField("", text: $model.snippetQuery)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 15))
+                        .focused($searchFocused)
+                        .onSubmit { pasteSelectedSnippet() }
+                        .accessibilityLabel("Search snippets")
+                        .disabled(snippetEditorDraft != nil)
+                }
+                if !model.snippetQuery.isEmpty, snippetEditorDraft == nil {
+                    Button { model.snippetQuery = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tertiary)
+                }
+                Button { beginNewSnippet() } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("New Snippet (⌘N)")
+                .disabled(snippetEditorDraft != nil)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: PanelMetrics.searchHeight)
+
+            Divider().frame(height: PanelMetrics.dividerHeight)
+
+            if model.snippets.isEmpty, snippetEditorDraft == nil {
+                snippetEmptyState
+            } else {
+                HStack(spacing: 0) {
+                    snippetList
+                        .frame(width: PanelMetrics.listWidth)
+                    Divider()
+                    if snippetEditorDraft != nil {
+                        snippetEditorPane
+                    } else {
+                        SnippetDetailPane(
+                            snippet: selectedSnippet,
+                            onEdit: beginEditingSnippet
+                        )
+                    }
+                }
+            }
+        }
+        .overlay {
+            Button("") { moveSelection(1) }
+                .keyboardShortcut(.downArrow, modifiers: [])
+                .opacity(0)
+                .allowsHitTesting(false)
+            Button("") { moveSelection(-1) }
+                .keyboardShortcut(.upArrow, modifiers: [])
+                .opacity(0)
+                .allowsHitTesting(false)
+            ForEach(1...9, id: \.self) { number in
+                Button("") { pasteNumberedSnippet(number) }
+                    .keyboardShortcut(KeyEquivalent(Character("\(number)")), modifiers: .command)
+                    .opacity(0)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onAppear {
+            searchFocused = true
+            selectFirstSnippetIfNeeded()
+            installShortcutMonitor()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .paceHistoryPanelDidShow)) { _ in
+            searchFocused = snippetEditorDraft == nil
+            selectFirstSnippetIfNeeded()
+        }
+        .onChange(of: model.snippets) { _ in snippetsDidChange() }
+    }
+
+    private var snippetEmptyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: model.snippetQuery.isEmpty ? "text.quote" : "magnifyingglass")
+                .font(.system(size: 28))
+                .foregroundStyle(.secondary)
+            Text(model.snippetQuery.isEmpty ? "No Snippets" : "No Results")
+                .font(.headline)
+            Text(model.snippetQuery.isEmpty
+                ? "Save something useful from Clipboard, or create a snippet."
+                : "Try a different search.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if model.snippetQuery.isEmpty {
+                Button("New Snippet") { beginNewSnippet() }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var snippetList: some View {
+        ScrollView {
+            LazyVStack(spacing: 0) {
+                ForEach(model.snippets, id: \.id) { snippet in
+                    snippetRow(snippet)
+                }
+            }
+            .background(OverlayScrollerStyle(handle: snippetListScroll))
+        }
+        .overlay(alignment: .topTrailing) { snippetShortcutBadgeRail }
+        .onChange(of: snippetSelection) { selected in
+            guard let selected,
+                  let index = model.snippets.firstIndex(where: { $0.id == selected }) else { return }
+            snippetListScroll.scrollUnitIntoView(index, unitHeight: PanelMetrics.listUnitHeight)
+        }
+    }
+
+    private func snippetRow(_ snippet: Snippet) -> some View {
+        SnippetRow(snippet: snippet)
+            .padding(.leading, 12)
+            .padding(.trailing, 44)
+            .frame(maxWidth: .infinity)
+            .frame(height: PanelMetrics.listUnitHeight)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.primary.opacity(snippetSelection == snippet.id ? 0.15 : 0))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+            )
+            .contentShape(Rectangle())
+            .onTapGesture(count: 2) { onPasteSnippet(snippet) }
+            .simultaneousGesture(TapGesture().onEnded { snippetSelection = snippet.id })
+            .contextMenu {
+                Button("Paste") { onPasteSnippet(snippet) }
+                Button("Copy") { onCopySnippet(snippet) }
+                Divider()
+                Button("Edit…") { beginEditingSnippet(snippet) }
+                Button("Duplicate") { duplicateSnippet(snippet) }
+                Button(snippet.isExpansionEnabled ? "Disable Expansion" : "Enable Expansion") {
+                    Task { await model.toggleSnippetExpansion(snippet) }
+                }
+                .disabled(snippet.keyword == nil)
+                Button(snippet.isPinned ? "Unpin" : "Pin") {
+                    Task { await model.toggleSnippetPin(snippet) }
+                }
+                Divider()
+                Button("Delete") { Task { await model.deleteSnippet(snippet) } }
+            }
+    }
+
+    private var snippetShortcutBadgeRail: some View {
+        ZStack(alignment: .topTrailing) {
+            ForEach(numberedVisibleSnippetSlots, id: \.number) { numbered in
+                Text("⌘\(numbered.number)")
+                    .font(.system(size: 10, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .frame(height: PanelMetrics.listUnitHeight)
+                    .offset(
+                        y: CGFloat(numbered.index) * PanelMetrics.listUnitHeight
+                            - snippetListScroll.scrollOffset
+                    )
+            }
+        }
+        .padding(.trailing, 14)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+        .clipped()
+        .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private var snippetEditorPane: some View {
+        if let initialDraft = snippetEditorDraft {
+            SnippetEditorPane(
+                draft: Binding(
+                    // AppKit can finish a text-field edit after SwiftUI has
+                    // begun removing this editor. Keep the retiring view's
+                    // binding readable without resurrecting stale state.
+                    get: {
+                        guard snippetEditorDraft?.snippet.id == initialDraft.snippet.id else {
+                            return initialDraft
+                        }
+                        return snippetEditorDraft ?? initialDraft
+                    },
+                    set: { updatedDraft in
+                        guard snippetEditorDraft?.snippet.id == initialDraft.snippet.id else {
+                            return
+                        }
+                        snippetEditorDraft = updatedDraft
+                    }
+                ),
+                errorMessage: snippetEditorError,
+                onSave: saveSnippetEditor,
+                onCancel: cancelSnippetEditor
+            )
+        }
     }
 
     private var emptyState: some View {
@@ -542,6 +892,15 @@ struct HistoryView: View {
                 Button(record.isPinned ? "Unpin" : "Pin") {
                     Task { await model.togglePin(record) }
                 }
+                if canPromote(record) {
+                    Divider()
+                    if let derived = model.snippetDerived(from: record) {
+                        Button("Open Snippet “\(derived.name)”…") { openSnippet(derived) }
+                    }
+                    Button(record.kind == .image ? "Save OCR Text as Snippet…" : "Save as Snippet…") {
+                        beginPromotion(record)
+                    }
+                }
             }
     }
 
@@ -552,11 +911,29 @@ struct HistoryView: View {
         onPaste(numbered.record, .original)
     }
 
+    private func pasteNumberedSnippet(_ number: Int) {
+        guard let numbered = numberedVisibleSnippetSlots.first(where: { $0.number == number }) else {
+            return
+        }
+        onPasteSnippet(numbered.snippet)
+    }
+
     private func moveSelection(_ delta: Int) {
-        guard !model.records.isEmpty else { return }
-        let currentIndex = selection.flatMap { id in model.records.firstIndex { $0.id == id } } ?? -1
-        let nextIndex = min(max(currentIndex + delta, 0), model.records.count - 1)
-        selection = model.records[nextIndex].id
+        guard snippetEditorDraft == nil else { return }
+        switch model.panelScope {
+        case .clipboard:
+            guard !model.records.isEmpty else { return }
+            let currentIndex = selection.flatMap { id in model.records.firstIndex { $0.id == id } } ?? -1
+            let nextIndex = min(max(currentIndex + delta, 0), model.records.count - 1)
+            selection = model.records[nextIndex].id
+        case .snippets:
+            guard !model.snippets.isEmpty else { return }
+            let currentIndex = snippetSelection.flatMap { id in
+                model.snippets.firstIndex { $0.id == id }
+            } ?? -1
+            let nextIndex = min(max(currentIndex + delta, 0), model.snippets.count - 1)
+            snippetSelection = model.snippets[nextIndex].id
+        }
     }
 
     // The search field's editor consumes some modified keys before hidden
@@ -572,15 +949,40 @@ struct HistoryView: View {
                 NotificationCenter.default.post(name: .paceOpenSettings, object: nil)
                 return nil
             }
+            if event.keyCode == 1, modifiers == .command {  // ⌘S
+                if snippetEditorDraft != nil {
+                    saveSnippetEditor()
+                    return nil
+                }
+            }
+            if snippetEditorDraft != nil { return event }
+            if model.panelScope == .snippets,
+               event.keyCode == 45, modifiers == .command {  // ⌘N
+                beginNewSnippet()
+                return nil
+            }
+            if model.panelScope == .snippets,
+               event.keyCode == 14, modifiers == .command {  // ⌘E
+                if let snippet = selectedSnippet { beginEditingSnippet(snippet) }
+                return nil
+            }
+            if model.panelScope == .snippets,
+               event.keyCode == 2, modifiers == .command {  // ⌘D
+                if let snippet = selectedSnippet { duplicateSnippet(snippet) }
+                return nil
+            }
             if event.keyCode == 126, modifiers == .command {  // ⌘↑
-                selection = model.records.first?.id
+                if model.panelScope == .clipboard { selection = model.records.first?.id }
+                else { snippetSelection = model.snippets.first?.id }
                 return nil
             }
             if event.keyCode == 125, modifiers == .command {  // ⌘↓
-                selection = model.records.last?.id
+                if model.panelScope == .clipboard { selection = model.records.last?.id }
+                else { snippetSelection = model.snippets.last?.id }
                 return nil
             }
             guard let action = PanelShortcuts.action(matching: event) else { return event }
+            if action == .saveAsSnippet, model.panelScope != .clipboard { return event }
             if action == .paste, modifiers.isEmpty,
                event.keyCode == 36 || event.keyCode == 76,
                let textView = NSApp.keyWindow?.firstResponder as? NSTextView,
@@ -590,7 +992,8 @@ struct HistoryView: View {
                 // landed — Return still pastes the selection.
                 return event
             }
-            perform(action)
+            if model.panelScope == .clipboard { perform(action) }
+            else { performSnippetAction(action) }
             return nil
         }
     }
@@ -602,7 +1005,24 @@ struct HistoryView: View {
         case .pasteSingleLine: performPaste(mode: .trimmedSingleLine)
         case .pasteOCRText: performPaste(mode: .ocrText)
         case .copy: performCopy()
+        case .saveAsSnippet:
+            if let record = selectedRecord { beginPromotion(record) }
         case .delete: deleteSelected()
+        }
+    }
+
+    private func performSnippetAction(_ action: PanelAction) {
+        switch action {
+        case .paste, .pastePlainText, .pasteSingleLine, .pasteOCRText:
+            pasteSelectedSnippet()
+        case .copy:
+            if let snippet = selectedSnippet { onCopySnippet(snippet) }
+        case .saveAsSnippet:
+            break
+        case .delete:
+            if let snippet = selectedSnippet {
+                Task { await model.deleteSnippet(snippet) }
+            }
         }
     }
 
@@ -645,6 +1065,154 @@ struct HistoryView: View {
             break
         }
         onPaste(record, mode)
+    }
+
+    private func pasteSelectedSnippet() {
+        guard snippetEditorDraft == nil, let snippet = selectedSnippet else { return }
+        onPasteSnippet(snippet)
+    }
+
+    private func canPromote(_ record: ClipboardRecord) -> Bool {
+        switch record.kind {
+        case .text, .richText, .url:
+            return true
+        case .image:
+            return record.hasOCR
+        case .files, .unknown:
+            return false
+        }
+    }
+
+    private func beginPromotion(_ record: ClipboardRecord) {
+        guard canPromote(record) else { return }
+        if let existing = model.snippetDerived(from: record) {
+            openSnippetConfiguration(existing)
+            return
+        }
+        Task {
+            guard var snippet = await model.snippetForPromotion(from: record) else { return }
+            // Create the permanent item first. The editor then configures the
+            // optional expansion keyword; canceling leaves a useful snippet.
+            snippet.keyword = nil
+            snippet.isExpansionEnabled = false
+            model.snippetQuery = ""
+            guard let saved = await model.saveSnippet(snippet) else { return }
+            openSnippetConfiguration(saved, prefillKeyword: true)
+        }
+    }
+
+    private func openSnippetConfiguration(_ snippet: Snippet, prefillKeyword: Bool = false) {
+        model.snippetQuery = ""
+        snippetSelection = snippet.id
+        pendingSnippetConfiguration = PendingSnippetConfiguration(
+            snippet: snippet,
+            prefillKeyword: prefillKeyword
+        )
+        if model.panelScope == .snippets {
+            presentPendingSnippetConfiguration()
+        } else {
+            model.panelScope = .snippets
+        }
+    }
+
+    private func presentPendingSnippetConfiguration() {
+        guard let pending = pendingSnippetConfiguration else { return }
+        var configurable = pending.snippet
+        if pending.prefillKeyword {
+            let prefix = SnippetExpansionPreferences.defaultPrefix
+            configurable.keyword = prefix.isEmpty ? nil : prefix
+            configurable.isExpansionEnabled = !prefix.isEmpty
+        }
+        pendingSnippetConfiguration = nil
+        snippetEditorError = nil
+        snippetEditorDraft = SnippetEditorDraft(snippet: configurable)
+        searchFocused = false
+    }
+
+    private func beginNewSnippet() {
+        let prefix = SnippetExpansionPreferences.defaultPrefix
+        snippetEditorError = nil
+        snippetEditorDraft = SnippetEditorDraft(
+            snippet: Snippet(
+                name: "",
+                template: "",
+                keyword: prefix.isEmpty ? nil : prefix,
+                isExpansionEnabled: true
+            ),
+            isNew: true
+        )
+        searchFocused = false
+    }
+
+    private func beginEditingSnippet(_ snippet: Snippet) {
+        snippetEditorError = nil
+        snippetEditorDraft = SnippetEditorDraft(snippet: snippet)
+        searchFocused = false
+    }
+
+    private func duplicateSnippet(_ snippet: Snippet) {
+        var duplicate = snippet
+        duplicate.id = UUID()
+        duplicate.name += " Copy"
+        duplicate.keyword = nil
+        duplicate.isExpansionEnabled = false
+        duplicate.isPinned = false
+        duplicate.createdAt = Date()
+        duplicate.updatedAt = Date()
+        duplicate.lastUsedAt = nil
+        duplicate.useCount = 0
+        duplicate.sourceRecordID = nil
+        snippetEditorError = nil
+        snippetEditorDraft = SnippetEditorDraft(snippet: duplicate, isNew: true)
+        searchFocused = false
+    }
+
+    private func saveSnippetEditor() {
+        guard let draft = snippetEditorDraft else { return }
+        Task {
+            if let saved = await model.saveSnippet(draft.resolvedSnippet) {
+                snippetSelection = saved.id
+                snippetEditorError = nil
+                snippetEditorDraft = nil
+                searchFocused = true
+            } else {
+                snippetEditorError = model.statusMessage ?? "The snippet could not be saved."
+            }
+        }
+    }
+
+    private func cancelSnippetEditor() {
+        pendingSnippetConfiguration = nil
+        snippetEditorDraft = nil
+        snippetEditorError = nil
+        searchFocused = true
+    }
+
+    private func openSnippet(_ snippet: Snippet) {
+        cancelSnippetEditor()
+        model.panelScope = .snippets
+        snippetSelection = snippet.id
+    }
+
+    private func selectFirstSnippetIfNeeded() {
+        if snippetSelection == nil || !model.snippets.contains(where: { $0.id == snippetSelection }) {
+            snippetSelection = model.snippets.first?.id
+        }
+        lastSnippetFirstID = model.snippets.first?.id
+        lastSnippetQuery = model.snippetQuery
+    }
+
+    private func snippetsDidChange() {
+        let firstID = model.snippets.first?.id
+        let queryChanged = model.snippetQuery != lastSnippetQuery
+        lastSnippetQuery = model.snippetQuery
+        if queryChanged {
+            snippetSelection = firstID
+        } else if snippetSelection == nil
+                    || !model.snippets.contains(where: { $0.id == snippetSelection }) {
+            snippetSelection = firstID
+        }
+        lastSnippetFirstID = firstID
     }
 
     private func selectFirstIfNeeded() {
@@ -949,6 +1517,12 @@ private struct ClipboardRow: View {
                 .font(.system(size: 13))
                 .lineLimit(1)
             Spacer(minLength: 6)
+            if model.snippetDerived(from: record) != nil {
+                Image(systemName: "text.quote")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.blue)
+                    .help("Saved as a snippet")
+            }
             if record.isPinned {
                 Image(systemName: "pin.fill")
                     .font(.system(size: 9))
@@ -997,6 +1571,9 @@ private struct ClipboardRow: View {
 private struct DetailPane: View {
     @EnvironmentObject private var model: AppModel
     let record: ClipboardRecord?
+    let derivedSnippet: Snippet?
+    let onSaveAsSnippet: (ClipboardRecord) -> Void
+    let onOpenSnippet: (Snippet) -> Void
     @State private var image: CachedItemImage?
     @State private var text: String?
     @State private var loadedID: UUID?
@@ -1061,6 +1638,22 @@ private struct DetailPane: View {
             infoRow("Size", panelByteFormatter.string(fromByteCount: record.byteCount))
             infoRow("Times copied", "\(record.copyCount)")
             infoRow("Last copied", record.lastCopiedAt.formatted(date: .abbreviated, time: .shortened))
+            if canSaveAsSnippet(record) {
+                Divider().padding(.vertical, 2)
+                HStack {
+                    if let derivedSnippet {
+                        Button("Open \(derivedSnippet.keyword ?? derivedSnippet.name)") {
+                            onOpenSnippet(derivedSnippet)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    Spacer()
+                    Button(record.kind == .image ? "Save OCR as Snippet…" : "Save as Snippet…") {
+                        onSaveAsSnippet(record)
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
         }
         .font(.system(size: 12))
         .padding(12)
@@ -1073,6 +1666,14 @@ private struct DetailPane: View {
             Text(value)
                 .lineLimit(1)
                 .truncationMode(.middle)
+        }
+    }
+
+    private func canSaveAsSnippet(_ record: ClipboardRecord) -> Bool {
+        switch record.kind {
+        case .text, .richText, .url: return true
+        case .image: return record.hasOCR
+        case .files, .unknown: return false
         }
     }
 
@@ -1089,5 +1690,288 @@ private struct DetailPane: View {
             image = nil
         }
         loadedID = record.id
+    }
+}
+
+private struct SnippetRow: View {
+    let snippet: Snippet
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "text.quote")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 28, height: 28)
+                .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+            Text(snippet.name)
+                .font(.system(size: 13))
+                .lineLimit(1)
+            Spacer(minLength: 6)
+            if let keyword = snippet.keyword {
+                Text(keyword)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(snippet.isExpansionEnabled ? .secondary : .tertiary)
+                    .lineLimit(1)
+            }
+            if snippet.isPinned {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private struct SnippetDetailPane: View {
+    @EnvironmentObject private var model: AppModel
+    let snippet: Snippet?
+    let onEdit: (Snippet) -> Void
+    @State private var renderedText: String?
+    @State private var renderingError: String?
+
+    var body: some View {
+        if let snippet {
+            VStack(spacing: 0) {
+                Group {
+                    if let renderedText {
+                        PlainTextPreview(text: renderedText)
+                    } else if let renderingError {
+                        VStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .foregroundStyle(.orange)
+                            Text(renderingError)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 24)
+                        }
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Divider()
+                VStack(alignment: .leading, spacing: 7) {
+                    infoRow("Keyword", snippet.keyword ?? "None")
+                    if !snippet.tags.isEmpty {
+                        infoRow("Tags", snippet.tags.joined(separator: ", "))
+                    }
+                    infoRow("Expansion", snippet.isExpansionEnabled ? "Enabled" : "Disabled")
+                    infoRow("Times used", "\(snippet.useCount)")
+                    infoRow("Modified", snippet.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                    Divider().padding(.vertical, 2)
+                    HStack {
+                        Text("Return to paste · ⌘Return to copy")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                        Spacer()
+                        Button("Edit…") { onEdit(snippet) }
+                            .buttonStyle(.borderless)
+                            .keyboardShortcut("e", modifiers: .command)
+                    }
+                }
+                .font(.system(size: 12))
+                .padding(12)
+            }
+            .task(id: snippet.updatedAt) { await load(snippet) }
+        } else {
+            VStack(spacing: 8) {
+                Image(systemName: "text.quote")
+                    .font(.system(size: 24))
+                    .foregroundStyle(.tertiary)
+                Text("No Selection")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func infoRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).lineLimit(1).truncationMode(.middle)
+        }
+    }
+
+    private func load(_ snippet: Snippet) async {
+        do {
+            let rendered = try await model.renderSnippet(snippet)
+            guard !Task.isCancelled else { return }
+            renderedText = rendered.text
+            renderingError = nil
+        } catch {
+            guard !Task.isCancelled else { return }
+            renderedText = nil
+            renderingError = error.localizedDescription
+        }
+    }
+}
+
+private struct SnippetEditorPane: View {
+    @Binding var draft: SnippetEditorDraft
+    let errorMessage: String?
+    let onSave: () -> Void
+    let onCancel: () -> Void
+    @FocusState private var nameFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(draft.isNew ? "New Snippet" : "Edit Snippet")
+                    .font(.headline)
+                Spacer()
+                Menu {
+                    placeholderButton(
+                        "Current Date",
+                        value: "{date}",
+                        example: renderedExample(for: "{date}")
+                    )
+                    placeholderButton(
+                        "Current Time",
+                        value: "{time}",
+                        example: renderedExample(for: "{time}")
+                    )
+                    placeholderButton(
+                        "Date & Time",
+                        value: "{datetime}",
+                        example: renderedExample(for: "{datetime}")
+                    )
+                    placeholderButton(
+                        "ISO 8601 Date & Time",
+                        value: "{datetime format=iso8601}",
+                        example: renderedExample(for: "{datetime format=iso8601}")
+                    )
+                    Divider()
+                    placeholderButton(
+                        "Clipboard",
+                        value: "{clipboard}",
+                        example: "latest copied text"
+                    )
+                    placeholderButton(
+                        "Previous Clipboard",
+                        value: "{clipboard offset=1}",
+                        example: "second-latest copied text"
+                    )
+                    placeholderButton(
+                        "Cursor Position",
+                        value: "{cursor}",
+                        example: "cursor lands here"
+                    )
+                    placeholderButton(
+                        "UUID",
+                        value: "{uuid}",
+                        example: "A1B2C3D4-…"
+                    )
+                } label: {
+                    Label("Insert Variable", systemImage: "curlybraces")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+
+            field("Name") {
+                TextField("Required", text: $draft.snippet.name)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($nameFocused)
+            }
+
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                field("Keyword") {
+                    TextField("Optional", text: keywordBinding)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                }
+                Toggle("Expand", isOn: $draft.snippet.isExpansionEnabled)
+                    .toggleStyle(.checkbox)
+                    .disabled(draft.resolvedSnippet.keyword == nil)
+                    .fixedSize()
+            }
+
+            field("Tags") {
+                TextField("Comma-separated", text: $draft.tagsText)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Template")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $draft.snippet.template)
+                    .font(.system(size: 12, design: .monospaced))
+                    .scrollContentBackground(.hidden)
+                    .padding(5)
+                    .background(Color(nsColor: .textBackgroundColor).opacity(0.45))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
+                    )
+                    .frame(minHeight: 90)
+            }
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            }
+
+            HStack {
+                Text("⌘S to save · Esc to cancel")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Button("Cancel", action: onCancel)
+                Button("Save", action: onSave)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(
+                        draft.snippet.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || draft.snippet.template.isEmpty
+                    )
+            }
+        }
+        .padding(14)
+        .onAppear { nameFocused = true }
+    }
+
+    private var keywordBinding: Binding<String> {
+        Binding(
+            get: { draft.snippet.keyword ?? "" },
+            set: { draft.snippet.keyword = $0 }
+        )
+    }
+
+    private func placeholderButton(
+        _ label: String,
+        value: String,
+        example: String
+    ) -> some View {
+        Button("\(label) · \(value) → \(example)") {
+            if !draft.snippet.template.isEmpty,
+               draft.snippet.template.last?.isWhitespace == false {
+                draft.snippet.template += " "
+            }
+            draft.snippet.template += value
+        }
+    }
+
+    private func renderedExample(for placeholder: String) -> String {
+        (try? SnippetTemplateRenderer.render(placeholder).text) ?? "example"
+    }
+
+    private func field<Content: View>(
+        _ label: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 52, alignment: .trailing)
+            content()
+        }
     }
 }

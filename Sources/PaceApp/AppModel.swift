@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import CryptoKit
 import Foundation
 import ImageIO
@@ -29,13 +30,22 @@ enum VaultState: Equatable {
 final class AppModel: ObservableObject {
     @Published private(set) var vaultState: VaultState = .locked
     @Published private(set) var records: [ClipboardRecord] = []
+    @Published private(set) var snippets: [Snippet] = []
     @Published private(set) var retentionPolicy: RetentionPolicy = .defaults
     @Published private(set) var storageBytes: Int64 = 0
+    @Published var panelScope: PacePanelScope = .clipboard
     @Published var query = "" {
         didSet {
             guard query != oldValue else { return }
             searchTask?.cancel()
             searchTask = Task { await refresh(updateStorageSummary: false) }
+        }
+    }
+    @Published var snippetQuery = "" {
+        didSet {
+            guard snippetQuery != oldValue else { return }
+            snippetSearchTask?.cancel()
+            snippetSearchTask = Task { await refreshSnippets() }
         }
     }
     @Published var capturePaused = false {
@@ -52,11 +62,15 @@ final class AppModel: ObservableObject {
     @Published private(set) var hasPromptedForAccessibility = false
 
     private let store: HistoryStore
+    private let snippetStore: SnippetStore
     private let keyStore = VaultKeyStore()
     private let detector = SensitiveContentDetector()
     private let ocrService = OCRService()
     private var monitor: ClipboardMonitor!
+    private var expansionMonitor: SnippetExpansionMonitor!
     private var searchTask: Task<Void, Never>?
+    private var snippetSearchTask: Task<Void, Never>?
+    private var snippetCatalog: [Snippet] = []
     private var captureResumeTask: Task<Void, Never>?
     private let itemImageCache: NSCache<NSString, CachedItemImage> = {
         let cache = NSCache<NSString, CachedItemImage>()
@@ -75,8 +89,12 @@ final class AppModel: ObservableObject {
 
     init(rootURL: URL = PacePaths.applicationSupportDirectory) {
         store = HistoryStore(rootURL: rootURL)
+        snippetStore = SnippetStore(rootURL: rootURL)
         monitor = ClipboardMonitor { [weak self] snapshot in
             self?.capture(snapshot)
+        }
+        expansionMonitor = SnippetExpansionMonitor { [weak self] match in
+            self?.expandSnippet(match)
         }
 
         Task { retentionPolicy = await store.retentionPolicy() }
@@ -104,6 +122,15 @@ final class AppModel: ObservableObject {
                     await self?.lock()
                     await self?.unlock()
                 }
+            }
+        )
+        workspaceObservers.append(
+            center.addObserver(
+                forName: NSWorkspace.didActivateApplicationNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.updateExpansionState() }
             }
         )
 
@@ -139,16 +166,25 @@ final class AppModel: ObservableObject {
                 return
             }
             try await store.unlock(with: key)
+            try await snippetStore.unlock(with: key)
             guard generation == securityGeneration else {
                 await store.lock()
+                await snippetStore.lock()
                 vaultState = .locked
                 return
             }
             retentionPolicy = await store.retentionPolicy()
             vaultState = .unlocked
             updateCaptureState()
+            // Text expansion should become available as soon as the vault is
+            // open. A large clipboard catalog can take noticeably longer to
+            // refresh and must not delay the global expansion listener.
+            updateExpansionState()
+            await refreshSnippets()
             await refresh()
         } catch {
+            await store.lock()
+            await snippetStore.lock()
             vaultState = .failed(error.localizedDescription)
             statusMessage = error.localizedDescription
         }
@@ -157,8 +193,12 @@ final class AppModel: ObservableObject {
     func lock() async {
         securityGeneration += 1
         monitor.stop()
+        expansionMonitor.stop()
         await store.lock()
+        await snippetStore.lock()
         records = []
+        snippets = []
+        snippetCatalog = []
         storageBytes = 0
         // Decrypted content must not outlive the vault lock.
         itemImageCache.removeAllObjects()
@@ -204,6 +244,32 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func refreshSnippets() async {
+        guard vaultState == .unlocked else { return }
+        let requestedQuery = snippetQuery
+        do {
+            let catalog = try await snippetStore.all(limit: 10_000)
+            let found = SnippetSearchEngine.search(catalog, query: requestedQuery, limit: 250)
+            guard vaultState == .unlocked else { return }
+            // Expansion uses the full catalog and must not depend on whether
+            // a concurrent UI search changed while this read was in flight.
+            snippetCatalog = catalog
+            let expansionSnippets = catalog.filter {
+                $0.isExpansionEnabled && $0.keyword != nil
+            }
+            expansionMonitor.update(snippets: expansionSnippets)
+            guard requestedQuery == snippetQuery else { return }
+            snippets = found
+        } catch {
+            if requestedQuery == snippetQuery { statusMessage = error.localizedDescription }
+        }
+    }
+
+    func refreshSnippetExpansionSettings() {
+        updateExpansionState()
+        Task { await refreshSnippets() }
+    }
+
     func copy(_ record: ClipboardRecord, mode: ClipboardRestoreMode = .original) async {
         do {
             let item = try await store.item(id: record.id)
@@ -246,6 +312,121 @@ final class AppModel: ObservableObject {
         do {
             try await store.delete(id: record.id)
             await refresh()
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func snippetDerived(from record: ClipboardRecord) -> Snippet? {
+        snippetCatalog.first { $0.sourceRecordID == record.id }
+    }
+
+    func snippetForPromotion(from record: ClipboardRecord) async -> Snippet? {
+        guard vaultState == .unlocked,
+              let item = try? await store.item(id: record.id),
+              let text = item.plainText ?? item.ocrText,
+              !text.isEmpty else {
+            statusMessage = "This clipboard item does not contain text that can become a snippet."
+            return nil
+        }
+        let baseName = suggestedSnippetName(for: text, record: record)
+        let existingNames = Set(snippetCatalog.map { $0.name.lowercased() })
+        var name = baseName
+        var suffix = 2
+        while existingNames.contains(name.lowercased()) {
+            name = "\(baseName) \(suffix)"
+            suffix += 1
+        }
+        let prefix = SnippetExpansionPreferences.defaultPrefix
+        return Snippet(
+            name: name,
+            template: text,
+            keyword: prefix.isEmpty ? nil : prefix,
+            isExpansionEnabled: true,
+            sourceRecordID: record.id
+        )
+    }
+
+    @discardableResult
+    func saveSnippet(_ snippet: Snippet) async -> Snippet? {
+        do {
+            do {
+                _ = try SnippetTemplateRenderer.render(
+                    snippet.template,
+                    context: try await snippetRenderingContext()
+                )
+            } catch PaceError.notFound {
+                // Dynamic clipboard entries and a referenced snippet can be
+                // unavailable while editing; preserve the valid template so
+                // it can resolve later when the context exists.
+            }
+            let saved = try await snippetStore.upsert(snippet)
+            await refreshSnippets()
+            restartExpansionMonitor()
+            statusMessage = saved.keyword.map { "Saved as \($0)" } ?? "Snippet saved"
+            return saved
+        } catch {
+            statusMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    func deleteSnippet(_ snippet: Snippet) async {
+        do {
+            try await snippetStore.delete(id: snippet.id)
+            await refreshSnippets()
+            restartExpansionMonitor()
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func toggleSnippetPin(_ snippet: Snippet) async {
+        var edited = snippet
+        edited.isPinned.toggle()
+        _ = await saveSnippet(edited)
+    }
+
+    func toggleSnippetExpansion(_ snippet: Snippet) async {
+        var edited = snippet
+        edited.isExpansionEnabled.toggle()
+        _ = await saveSnippet(edited)
+    }
+
+    func renderSnippet(_ snippet: Snippet) async throws -> RenderedSnippet {
+        try SnippetTemplateRenderer.render(
+            snippet.template,
+            context: try await snippetRenderingContext()
+        )
+    }
+
+    func pasteSnippet(_ snippet: Snippet, into target: NSRunningApplication?) async {
+        do {
+            let rendered = try await renderSnippet(snippet)
+            try await pasteRenderedSnippet(
+                rendered,
+                into: target,
+                restoresClipboard: SnippetExpansionPreferences.restoresClipboard
+            )
+            _ = try await snippetStore.recordUse(id: snippet.id)
+            await refreshSnippets()
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func copySnippet(_ snippet: Snippet) async {
+        do {
+            let rendered = try await renderSnippet(snippet)
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(rendered.text, forType: .string)
+            monitor.acknowledgeCurrentClipboard()
+            _ = try await store.add(snippetOutputItem(rendered.text, snippet: snippet))
+            _ = try await snippetStore.recordUse(id: snippet.id)
+            await refresh()
+            await refreshSnippets()
+            statusMessage = "Copied"
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -565,6 +746,145 @@ final class AppModel: ObservableObject {
     private func updateCaptureState() {
         if vaultState == .unlocked, !capturePaused { monitor.start() }
         else { monitor.stop() }
+    }
+
+    private func updateExpansionState() {
+        if vaultState == .unlocked, SnippetExpansionPreferences.isEnabled {
+            expansionMonitor.start()
+        } else {
+            expansionMonitor.stop()
+        }
+    }
+
+    private func restartExpansionMonitor() {
+        if vaultState == .unlocked, SnippetExpansionPreferences.isEnabled {
+            expansionMonitor.restart()
+        } else {
+            expansionMonitor.stop()
+        }
+    }
+
+    private func expandSnippet(_ match: SnippetExpansionMonitor.Match) {
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.expansionMonitor.finishMatch() }
+            do {
+                var rendered = try await self.renderSnippet(match.snippet)
+                if let delimiter = match.delimiter {
+                    rendered.text += delimiter
+                }
+                try await Task.sleep(
+                    nanoseconds: UInt64(SnippetExpansionPreferences.injectionDelay * 1_000_000_000)
+                )
+                try self.synthesizeDelete(characterCount: match.triggerCharacterCount)
+                try await self.pasteRenderedSnippet(
+                    rendered,
+                    into: match.targetApplication,
+                    restoresClipboard: SnippetExpansionPreferences.restoresClipboard
+                )
+                _ = try await self.snippetStore.recordUse(id: match.snippet.id)
+                await self.refreshSnippets()
+            } catch {
+                self.statusMessage = error.localizedDescription
+                NSSound.beep()
+            }
+        }
+    }
+
+    private func snippetRenderingContext() async throws -> SnippetRenderingContext {
+        let clipboardItems = try await store.textHistory(limit: 50)
+        let allSnippets = try await snippetStore.all(limit: 10_000)
+        return SnippetRenderingContext(
+            clipboardItems: clipboardItems,
+            snippetTemplates: Dictionary(uniqueKeysWithValues: allSnippets.map { ($0.name, $0.template) })
+        )
+    }
+
+    private func pasteRenderedSnippet(
+        _ rendered: RenderedSnippet,
+        into target: NSRunningApplication?,
+        restoresClipboard: Bool
+    ) async throws {
+        let pasteboard = NSPasteboard.general
+        let priorContents = PasteboardSnapshot.capture(from: pasteboard)
+        pasteboard.clearContents()
+        pasteboard.setString(rendered.text, forType: .string)
+        let renderedChangeCount = pasteboard.changeCount
+        monitor.acknowledgeCurrentClipboard()
+        try await synthesizePaste(into: target)
+        if rendered.cursorMovementFromEnd > 0 {
+            try await Task.sleep(nanoseconds: 45_000_000)
+            try synthesizeLeftArrow(count: rendered.cursorMovementFromEnd)
+        }
+        guard restoresClipboard else { return }
+        try await Task.sleep(nanoseconds: 260_000_000)
+        guard pasteboard.changeCount == renderedChangeCount else { return }
+        if let priorContents { priorContents.restore(to: pasteboard) }
+        else { pasteboard.clearContents() }
+        monitor.acknowledgeCurrentClipboard()
+    }
+
+    private func synthesizeDelete(characterCount: Int) throws {
+        try synthesizeKey(keyCode: UInt16(kVK_Delete), count: characterCount)
+    }
+
+    private func synthesizeLeftArrow(count: Int) throws {
+        try synthesizeKey(keyCode: UInt16(kVK_LeftArrow), count: count)
+    }
+
+    private func synthesizeKey(keyCode: UInt16, count: Int) throws {
+        guard let source = CGEventSource(stateID: .combinedSessionState) else {
+            throw PaceError.unavailable("Could not synthesize the snippet expansion.")
+        }
+        for _ in 0..<max(0, count) {
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
+                throw PaceError.unavailable("Could not synthesize the snippet expansion.")
+            }
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func suggestedSnippetName(for text: String, record: ClipboardRecord) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("@"), !trimmed.contains(where: \ .isWhitespace), trimmed.count <= 100 {
+            return "Email"
+        }
+        if let url = URL(string: trimmed), let host = url.host, !host.isEmpty {
+            return host
+        }
+        if record.kind == .image { return "OCR Snippet" }
+        let firstLine = trimmed.split(whereSeparator: \ .isNewline).first.map(String.init) ?? "New Snippet"
+        return firstLine
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .prefixString(48)
+    }
+
+    private func snippetOutputItem(_ text: String, snippet: Snippet) -> ClipboardItem {
+        let data = Data(text.utf8)
+        let sourceName = "Pace Snippet: \(snippet.name)"
+        var item = ClipboardItem(
+            source: ClipboardSource(
+                kind: .application,
+                name: sourceName,
+                bundleIdentifier: Bundle.main.bundleIdentifier
+            ),
+            kind: .text,
+            representations: [ClipboardRepresentation(
+                typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
+                data: data
+            )],
+            preview: text
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .prefixString(240),
+            searchableText: "\(sourceName)\n\(text)",
+            fingerprint: "",
+            byteCount: Int64(data.count)
+        )
+        item.fingerprint = item.contentFingerprint
+        return item
     }
 
     // Terminals can only take text through ⌘V, but several terminal programs

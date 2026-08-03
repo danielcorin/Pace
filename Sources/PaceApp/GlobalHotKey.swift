@@ -4,8 +4,23 @@ import Foundation
 
 struct HotKeyShortcut: Equatable {
     static let defaultShortcut = HotKeyShortcut(
+        keyCode: UInt32(kVK_ANSI_C),
+        modifiers: UInt32(cmdKey | optionKey | shiftKey | controlKey)
+    )
+
+    static let defaultSnippetShortcut = HotKeyShortcut(
+        keyCode: UInt32(kVK_ANSI_V),
+        modifiers: UInt32(cmdKey | optionKey | shiftKey | controlKey)
+    )
+
+    static let previousDefaultShortcut = HotKeyShortcut(
         keyCode: UInt32(kVK_ANSI_V),
         modifiers: UInt32(cmdKey | optionKey)
+    )
+
+    static let previousDefaultSnippetShortcut = HotKeyShortcut(
+        keyCode: UInt32(kVK_ANSI_V),
+        modifiers: UInt32(cmdKey | optionKey | shiftKey)
     )
 
     let keyCode: UInt32
@@ -22,7 +37,7 @@ struct HotKeyShortcut: Equatable {
         // Preserve shortcuts selected by versions of Pace that used a fixed picker.
         switch storedValue {
         case "commandOptionV":
-            self = Self.defaultShortcut
+            self = Self.previousDefaultShortcut
             return
         case "controlOptionV":
             self.init(keyCode: UInt32(kVK_ANSI_V), modifiers: UInt32(controlKey | optionKey))
@@ -156,20 +171,43 @@ struct HotKeyShortcut: Equatable {
 
 @MainActor
 final class GlobalHotKey {
+    private static var nextIdentifier: UInt32 = 1
+    private static let signature = OSType(0x50414345)
+
     private var hotKey: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
     private var callback: (() -> Void)?
+    private let identifier: EventHotKeyID
 
     init() {
+        identifier = EventHotKeyID(signature: Self.signature, id: Self.nextIdentifier)
+        Self.nextIdentifier += 1
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
         )
         InstallEventHandler(
             GetApplicationEventTarget(),
-            { _, _, userData in
-                guard let userData else { return noErr }
+            { _, event, userData in
+                guard let event, let userData else { return OSStatus(eventNotHandledErr) }
                 let manager = Unmanaged<GlobalHotKey>.fromOpaque(userData).takeUnretainedValue()
+                var pressed = EventHotKeyID()
+                let status = GetEventParameter(
+                    event,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &pressed
+                )
+                guard status == noErr,
+                      pressed.signature == manager.identifier.signature,
+                      pressed.id == manager.identifier.id else {
+                    // Multiple GlobalHotKey instances share the application
+                    // event target. Let the matching instance see this event.
+                    return OSStatus(eventNotHandledErr)
+                }
                 MainActor.assumeIsolated { manager.callback?() }
                 return noErr
             },
@@ -184,7 +222,6 @@ final class GlobalHotKey {
     func register(shortcut: HotKeyShortcut, callback: @escaping () -> Void) -> OSStatus {
         unregister()
         self.callback = callback
-        let identifier = EventHotKeyID(signature: OSType(0x50414345), id: 1)
         let status = RegisterEventHotKey(
             shortcut.keyCode,
             shortcut.modifiers,

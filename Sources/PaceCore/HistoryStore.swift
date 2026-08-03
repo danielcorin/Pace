@@ -71,6 +71,22 @@ public actor HistoryStore {
         return item
     }
 
+    /// Returns the newest retained entries that can be represented as text.
+    /// Snippet clipboard offsets deliberately skip opaque images and files so
+    /// every returned value can be inserted into a text template.
+    public func textHistory(limit: Int = 50) throws -> [String] {
+        _ = try requireKey()
+        var values: [String] = []
+        for record in records {
+            guard values.count < max(0, limit) else { break }
+            guard let item = try? self.item(id: record.id) else { continue }
+            if let text = item.plainText ?? item.ocrText, !text.isEmpty {
+                values.append(text)
+            }
+        }
+        return values
+    }
+
     @discardableResult
     public func add(_ incoming: ClipboardItem) throws -> ClipboardRecord {
         _ = try requireKey()

@@ -19,15 +19,16 @@ only the YAML is committed. `*.xcodeproj` is git-ignored and regenerated on dema
 
 ## Setup (once)
 ```sh
-brew install xcodegen
+mise trust
+mise install
 cp Configuration/Local.xcconfig.example Configuration/Local.xcconfig
 # edit Local.xcconfig: set DEVELOPMENT_TEAM and PRODUCT_BUNDLE_IDENTIFIER
-xcodegen generate
+mise exec -- xcodegen generate
 ```
 
 ## Regenerate the project (after editing project.yml, or after cloning)
 ```sh
-xcodegen generate
+mise exec -- xcodegen generate
 ```
 
 ## Build & test (headless, unsigned)
@@ -51,19 +52,21 @@ open build/Build/Products/Debug/Pace.app
 
 ## Release (signed + notarized)
 ```sh
-scripts/publish-release.sh --dry-run     # inspect the release plan
-scripts/publish-release.sh               # build a local signed/notarized ZIP + DMG
-scripts/publish-release.sh --publish     # + create the GitHub release
+mise exec -- scripts/publish-release.sh --dry-run     # inspect the release plan
+mise exec -- scripts/publish-release.sh               # build a local signed/notarized ZIP + DMG
+mise exec -- scripts/publish-release.sh --publish     # + create the GitHub release
 ```
 Set up notarization once with
-`scripts/publish-release.sh --setup-notary-profile PaceNotary`, or export
-`APPLE_ID`, `APPLE_ID_PASSWORD`, and `TEAM_ID` (see `.env.example`). Secrets never touch git.
+`mise exec -- scripts/publish-release.sh --setup-notary-profile PaceNotary`, or
+put `APPLE_ID`, `APPLE_ID_PASSWORD`, and `TEAM_ID` in `.env` (see
+`.env.example`). `mise exec --` loads that ignored file and redacts its values
+from mise output. Secrets never touch git.
 The script auto-detects the sole `.xcodeproj` and uses its name as the scheme;
 override with `--project` / `--scheme`.
 
 ## Conventions
 - To change project structure, targets, or build settings, edit `project.yml` and
-  run `xcodegen generate` — never edit the `.xcodeproj` by hand.
+  run `mise exec -- xcodegen generate` — never edit the `.xcodeproj` by hand.
 - Bump `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` in `project.yml`, regenerate,
   commit, then release. The release script asserts the committed version.
 - For a menu-bar/agent app with no Dock icon, set `INFOPLIST_KEY_LSUIElement` to `"YES"`.

@@ -20,5 +20,5 @@ xcuserdata/
 # Per-developer signing configuration
 Configuration/Local.xcconfig
 
-# direnv / secrets
+# mise-loaded release secrets
 /.env

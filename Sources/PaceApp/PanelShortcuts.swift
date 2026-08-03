@@ -10,6 +10,7 @@ enum PanelAction: String, CaseIterable, Identifiable {
     case pasteSingleLine
     case pasteOCRText
     case copy
+    case saveAsSnippet
     case delete
 
     var id: String { rawValue }
@@ -21,6 +22,7 @@ enum PanelAction: String, CaseIterable, Identifiable {
         case .pasteSingleLine: return "Paste as Single Line"
         case .pasteOCRText: return "Paste OCR Text"
         case .copy: return "Copy"
+        case .saveAsSnippet: return "Save as Snippet"
         case .delete: return "Delete"
         }
     }
@@ -32,6 +34,7 @@ enum PanelAction: String, CaseIterable, Identifiable {
         case .pasteSingleLine: return "Trim whitespace and paste as one line"
         case .pasteOCRText: return "Paste the text recognized in an image"
         case .copy: return "Copy the selected item without pasting"
+        case .saveAsSnippet: return "Create and configure a snippet from the selected clipboard item"
         case .delete: return "Remove the selected item from history"
         }
     }
@@ -48,6 +51,8 @@ enum PanelAction: String, CaseIterable, Identifiable {
             return HotKeyShortcut(keyCode: UInt32(kVK_Return), modifiers: UInt32(optionKey))
         case .copy:
             return HotKeyShortcut(keyCode: UInt32(kVK_Return), modifiers: UInt32(cmdKey))
+        case .saveAsSnippet:
+            return HotKeyShortcut(keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(cmdKey))
         case .delete:
             return HotKeyShortcut(keyCode: UInt32(kVK_Delete), modifiers: UInt32(cmdKey))
         }

@@ -125,4 +125,57 @@ final class HistoryStoreTests: XCTestCase {
 
         XCTAssertEqual(item.ocrText, "First line\nSecond line")
     }
+
+    func testTextHistoryUsesNewestTextAndOCRWhileSkippingOpaqueItems() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PaceTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = HistoryStore(rootURL: root)
+        try await store.unlock(with: SymmetricKey(size: .bits256))
+        let now = Date()
+
+        _ = try await store.add(ClipboardItem(
+            lastCopiedAt: now.addingTimeInterval(-200),
+            source: ClipboardSource(kind: .application, name: "Tests"),
+            kind: .text,
+            representations: [
+                ClipboardRepresentation(
+                    typeIdentifier: "public.utf8-plain-text",
+                    data: Data("older text".utf8)
+                )
+            ],
+            preview: "older text",
+            searchableText: "older text",
+            fingerprint: "text",
+            byteCount: 10
+        ))
+        _ = try await store.add(ClipboardItem(
+            lastCopiedAt: now.addingTimeInterval(-100),
+            source: ClipboardSource(kind: .application, name: "Tests"),
+            kind: .files,
+            representations: [],
+            preview: "opaque file",
+            searchableText: "opaque file",
+            fingerprint: "file",
+            byteCount: 1
+        ))
+        _ = try await store.add(ClipboardItem(
+            lastCopiedAt: now,
+            source: ClipboardSource(kind: .application, name: "Tests"),
+            kind: .image,
+            representations: [],
+            preview: "Image",
+            searchableText: "recognized text",
+            fingerprint: "image-with-ocr",
+            byteCount: 1,
+            ocrObservations: [
+                OCRObservation(text: "recognized text", confidence: 1, x: 0, y: 0, width: 1, height: 1)
+            ]
+        ))
+
+        let allText = try await store.textHistory()
+        let newestText = try await store.textHistory(limit: 1)
+        XCTAssertEqual(allText, ["recognized text", "older text"])
+        XCTAssertEqual(newestText, ["recognized text"])
+    }
 }

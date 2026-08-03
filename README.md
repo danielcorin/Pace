@@ -4,20 +4,23 @@
   <img src="Sources/PaceApp/Assets.xcassets/AppIcon.appiconset/icon_256.png" width="128" height="128" alt="Pace app icon">
 </p>
 
-Pace is a private, local-first clipboard manager for macOS. It lives in the menu
-bar, opens a compact searchable history with a global hotkey (default: `⌘⌥V`),
-and pastes the selected item straight into the app you were using. Copied images
-are OCR'd locally so their text is searchable and pasteable, and everything is
-encrypted at rest. A companion `pace` CLI exposes the same history to scripts
-and agents.
+Pace is a private, local-first clipboard and snippet manager for macOS. It lives
+in the menu bar, opens searchable clipboard history with `Hyper+C` and a
+permanent snippet library with `Hyper+V`, then pastes the selected item straight
+into the app you were using. Copied images are OCR'd locally so their text is
+searchable and pasteable, and everything is encrypted at rest. A companion
+`pace` CLI exposes clipboard history to scripts and agents.
 
 ## Features
 
 - Captures text, rich text, URLs, files, and images with their native pasteboard representations
-- Keyboard-first panel: type to search, `⏎` pastes, `⌘⏎` copies, `⇧⏎` pastes as plain text, `⌥⏎` pastes an image's OCR text, `⌘1`–`⌘9` paste by position, `⌘⌫` deletes, `Esc` closes
-- History grouped by date (Today, Yesterday, This Week, …) when browsing
+- Promotes useful clipboard entries into permanent, searchable snippets
+- Expands snippet keywords while you type, with configurable trigger behavior and per-app exclusions
+- Renders contextual snippet variables for dates, times, clipboard entries, UUIDs, cursor placement, and nested snippets
+- Keyboard-first panel: type to search, `⏎` pastes, `⌘⏎` copies, `⇧⏎` pastes as plain text, `⌘⇧⏎` trims whitespace and pastes as one line, `⌥⏎` pastes OCR text, `⌘1`–`⌘9` paste visible rows, `⌘⌫` deletes, and `Esc` closes
+- Configurable global and panel shortcuts, plus a detail pane with content previews and source metadata
 - Automatic local OCR through Vision; recognized text participates in search
-- Pasting an image into a text-only target falls back to its OCR text; terminals that support clipboard images (such as Claude Code via `Ctrl+V`) receive the actual image
+- Explicit OCR-text paste and copy actions for images; recognized terminals receive original image pastes through `Ctrl+V` for tools that support clipboard images, such as Claude Code
 - AES-GCM encrypted item files and search catalog; the vault key lives in the login keychain
 - Sensitive pasteboard markers and recognizable credential formats are never stored
 - Configurable retention limits by age, item count, and storage size
@@ -39,35 +42,75 @@ agents can read and write through a real CLI instead of UI automation.
 
 1. Launch Pace and grant Accessibility permission when prompted (required to paste directly into other apps).
 2. Copy things. Pace captures them in the background.
-3. Press `⌘⌥V` to open the panel over your current app, search or arrow to an item, and press `⏎` to paste it into the app you came from.
+3. Press `Hyper+C` (`⌃⌥⇧⌘C`) to open clipboard history over your current app, search or arrow to an item, and press `⏎` to paste it into the app you came from.
 
 Double-clicking a row pastes it; right-clicking offers paste variants, copy,
-and pin. Press `⌘⏎` to copy the selected item without pasting it, or `⌘⌫` to
-delete it from history. The panel hotkey is configurable in Settings (`⌘,`),
-along with launch-at-login, retention limits, and the CLI installer.
+and pin. Use `↑` and `↓` to move through history, `⌘↑` and `⌘↓` to jump
+to either end, and `⌘1`–`⌘9` to paste the rows currently aligned with those
+numbers. Press `⌘S` on a clipboard item to turn it into a snippet and open its
+configuration in the snippet library. The global hotkeys and the paste,
+plain-text, single-line, OCR, copy, save-as-snippet, and delete shortcuts are
+configurable in Settings (`⌘,`). Settings also includes launch-at-login,
+retention controls, and the CLI installer.
+
+## Snippets
+
+Press `Hyper+V` (`⌃⌥⇧⌘V`) to open the snippet library. Create a snippet from
+scratch or promote a clipboard item, then give it an optional keyword such as
+`;em`. With expansion enabled, typing that keyword in another app replaces it
+with the rendered snippet. Settings controls immediate or delimiter-triggered
+expansion, clipboard restoration, compatibility delay, and excluded apps.
+
+Templates support contextual variables. The editor's **Insert Variable** menu
+shows a live example beside each value.
+
+```text
+{date}                         current date
+{time}                         current time
+{datetime}                     current date and time
+{datetime format=iso8601}      ISO 8601 with the local UTC offset
+{clipboard}                    latest clipboard text
+{clipboard offset=1}           previous clipboard text
+{cursor}                       final cursor position
+{uuid}                         a new UUID
+{snippet name="Email"}         another snippet by name
+```
+
+Date variables also accept custom `DateFormatter` patterns, locales, and
+offsets such as `{date format="yyyy-MM-dd" offset="+1d"}`. Append modifiers
+with pipes, for example `{clipboard|trim|single-line}` or
+`{snippet name="Email"|uppercase}`. Literal braces can be escaped as `{{` and
+`}}`.
 
 ## The pace CLI
 
-In Settings, choose **Install Command Line Tool** to link the bundled CLI at
-`~/.local/bin/pace`.
+In the General settings tab, click **Install** beside **Command Line Tool** to
+link the bundled CLI at `~/.local/bin/pace`. Run `pace help` for the complete
+command reference.
 
 ```sh
 pace status
 pace show                      # open the history panel
 pace list --limit 20
-pace search 'invoice type:image'
-pace add 'generated by a script' --source agent
+pace search 'invoice type:image app:Preview has:ocr'
+pace add 'generated by a script' --source 'Build agent' --source-kind agent
 pace copy ITEM_ID
 pace paste ITEM_ID --ocr-text
 pace get ITEM_ID --ocr-text
+pace get ITEM_ID --output exported-item
+pace pin ITEM_ID
+pace delete ITEM_ID
 
 pace retention show
-pace retention set --days 30 --max-items 10000 --max-storage 1GB
+pace retention preview
+pace retention set --days 30 --max-items 10000 --max-storage 1GB --prune
 ```
 
 The CLI launches the menu-bar service when needed, and the vault unlocks
-automatically. `pace add` accepts `--timestamp` and `--source-kind` so imports
-can preserve history.
+automatically. Search supports `type:`, `app:`, `is:pinned`, and `has:ocr`
+filters. List, search, and get commands can return JSON. `pace add` accepts
+text, piped input, or a file, plus `--timestamp`, `--source-kind`, and
+`--session` metadata so imports and agent workflows can preserve context.
 
 ### Importing from Alfred
 
@@ -84,7 +127,7 @@ encrypted and cannot be imported.
 
 - macOS 13 or later
 - Xcode 16 or later (command-line tools) to build from source
-- [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`)
+- [mise](https://mise.jdx.dev/) for the pinned XcodeGen tool
 
 ## Build
 
@@ -96,8 +139,9 @@ The Xcode project is generated from `project.yml`; `*.xcodeproj` is not committe
 4. Generate and build:
 
 ```sh
-brew install xcodegen
-xcodegen generate
+mise trust
+mise install
+mise exec -- xcodegen generate
 open Pace.xcodeproj    # or build from the command line:
 
 xcodebuild \
@@ -133,32 +177,33 @@ credentials are stored in the repository. The workflow follows
 [Reco](https://github.com/danielcorin/Reco).
 
 Copy the release environment template, fill in your Apple credentials and
-GitHub repository, then allow direnv:
+GitHub repository, then trust the mise configuration once:
 
 ```sh
 cp .env.example .env
 $EDITOR .env
-direnv allow
+mise trust
 ```
 
-The ignored `.env` uses `APPLE_ID`, `APPLE_ID_PASSWORD`, `TEAM_ID`, and
-optionally `DEVELOPER_ID_APPLICATION`. On the first release, the script
-validates those values and stores the app-specific password in the
-`PaceNotary` Keychain profile. Later releases reuse that profile.
+`mise exec --` loads the ignored `.env` and redacts its values from mise
+output. The file uses `APPLE_ID`, `APPLE_ID_PASSWORD`, `TEAM_ID`, and optionally
+`DEVELOPER_ID_APPLICATION`. On the first release, the script validates those
+values and stores the app-specific password in the `PaceNotary` Keychain
+profile. Later releases reuse that profile.
 `NOTARY_PROFILE` defaults to `PaceNotary`; the older `NOTARY_APPLE_ID`,
 `DEVELOPER_IDENTITY`, and `DEVELOPMENT_TEAM` names remain supported. You can
 also create the profile explicitly:
 
 ```sh
-scripts/publish-release.sh --setup-notary-profile PaceNotary
+mise exec -- scripts/publish-release.sh --setup-notary-profile PaceNotary
 ```
 
 Before a release, update `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` in
 `project.yml`, regenerate the project, then commit and push those changes. Run:
 
 ```sh
-scripts/publish-release.sh --dry-run    # inspect the release plan
-scripts/publish-release.sh --publish    # build, notarize, and publish
+mise exec -- scripts/publish-release.sh --dry-run    # inspect the release plan
+mise exec -- scripts/publish-release.sh --publish    # build, notarize, and publish
 ```
 
 The publish command requires a clean branch synchronized with its upstream. It

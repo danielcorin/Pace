@@ -1,9 +1,17 @@
+import AppKit
 import PaceCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct PreferencesView: View {
     @EnvironmentObject private var model: AppModel
     @AppStorage("hotKeyChoice") private var hotKeyRawValue = HotKeyShortcut.defaultShortcut.storedValue
+    @AppStorage("snippetHotKeyChoice") private var snippetHotKeyRawValue = HotKeyShortcut.defaultSnippetShortcut.storedValue
+    @AppStorage(SnippetExpansionPreferences.enabledKey) private var snippetExpansionEnabled = true
+    @AppStorage(SnippetExpansionPreferences.modeKey) private var snippetExpansionMode = SnippetExpansionMode.immediately.rawValue
+    @AppStorage(SnippetExpansionPreferences.restoreClipboardKey) private var restoresClipboardAfterExpansion = true
+    @AppStorage(SnippetExpansionPreferences.defaultPrefixKey) private var defaultSnippetPrefix = ";"
+    @AppStorage(SnippetExpansionPreferences.injectionDelayKey) private var snippetInjectionDelay = 0.04
 
     @State private var days = "30"
     @State private var items = "10000"
@@ -18,6 +26,7 @@ struct PreferencesView: View {
     @State private var cliFeedback: Feedback?
     @State private var shortcutMessage: String?
     @State private var panelShortcuts: [PanelAction: HotKeyShortcut] = [:]
+    @State private var excludedSnippetApplications: [String] = []
 
     private struct Feedback: Equatable {
         var message: String
@@ -45,6 +54,9 @@ struct PreferencesView: View {
             shortcutsTab
                 .tabItem { Label("Shortcuts", systemImage: "command") }
 
+            snippetsTab
+                .tabItem { Label("Snippets", systemImage: "text.quote") }
+
             retentionTab
                 .tabItem { Label("Retention", systemImage: "clock.arrow.circlepath") }
         }
@@ -54,6 +66,10 @@ struct PreferencesView: View {
 
     private var currentShortcut: HotKeyShortcut {
         HotKeyShortcut(storedValue: hotKeyRawValue) ?? .defaultShortcut
+    }
+
+    private var currentSnippetShortcut: HotKeyShortcut {
+        HotKeyShortcut(storedValue: snippetHotKeyRawValue) ?? .defaultSnippetShortcut
     }
 
     // MARK: - General
@@ -126,13 +142,26 @@ struct PreferencesView: View {
                 LabeledContent {
                     HotKeyRecorder(
                         shortcut: currentShortcut,
-                        onBeginRecording: { AppRuntime.shared.suspendHotKey() },
+                        actionName: "Show Clipboard",
+                        onBeginRecording: { AppRuntime.shared.suspendHotKeys() },
                         onComplete: finishRecording
                     )
                     .frame(width: 150, height: 28)
                 } label: {
-                    Text("Show Pace")
+                    Text("Show Clipboard")
                     Text("Global keyboard shortcut to open the clipboard panel")
+                }
+                LabeledContent {
+                    HotKeyRecorder(
+                        shortcut: currentSnippetShortcut,
+                        actionName: "Show Snippets",
+                        onBeginRecording: { AppRuntime.shared.suspendHotKeys() },
+                        onComplete: finishSnippetRecording
+                    )
+                    .frame(width: 150, height: 28)
+                } label: {
+                    Text("Show Snippets")
+                    Text("Global keyboard shortcut to open the snippet library")
                 }
             }
 
@@ -143,7 +172,7 @@ struct PreferencesView: View {
                             shortcut: panelShortcut(for: action),
                             captureContext: .panel,
                             actionName: action.title,
-                            onBeginRecording: { AppRuntime.shared.suspendHotKey() },
+                            onBeginRecording: { AppRuntime.shared.suspendHotKeys() },
                             onComplete: { finishPanelRecording(for: action, shortcut: $0) }
                         )
                         .frame(width: 150, height: 28)
@@ -164,6 +193,94 @@ struct PreferencesView: View {
                     Button("Restore Defaults") { restoreDefaultPanelShortcuts() }
                 }
                 .padding(.top, 4)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    // MARK: - Snippets
+
+    private var snippetsTab: some View {
+        Form {
+            Section {
+                Toggle(isOn: $snippetExpansionEnabled) {
+                    Text("Expand snippets while typing")
+                    Text("Replace configured keywords in other applications")
+                }
+                .toggleStyle(.switch)
+                .onChange(of: snippetExpansionEnabled) { _ in
+                    model.refreshSnippetExpansionSettings()
+                }
+
+                Picker("Expansion mode", selection: $snippetExpansionMode) {
+                    ForEach(SnippetExpansionMode.allCases) { mode in
+                        Text(mode.title).tag(mode.rawValue)
+                    }
+                }
+                .onChange(of: snippetExpansionMode) { _ in
+                    model.refreshSnippetExpansionSettings()
+                }
+
+                LabeledContent {
+                    TextField("", text: $defaultSnippetPrefix)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                        .frame(width: 90)
+                } label: {
+                    Text("Default keyword prefix")
+                    Text("Prefills the keyword when creating a snippet")
+                }
+
+                Toggle(isOn: $restoresClipboardAfterExpansion) {
+                    Text("Restore clipboard after pasting")
+                    Text("Snippet insertion won't replace what you previously copied")
+                }
+                .toggleStyle(.switch)
+
+                Picker("Compatibility delay", selection: $snippetInjectionDelay) {
+                    Text("Fast").tag(0.02)
+                    Text("Normal").tag(0.04)
+                    Text("Slow").tag(0.10)
+                    Text("Extra Slow").tag(0.18)
+                }
+            } header: {
+                HStack {
+                    Text("Expansion")
+                    Spacer()
+                    Button("Open Snippets") {
+                        AppRuntime.shared.showPanel(scope: .snippets)
+                    }
+                    .font(.caption)
+                }
+            }
+
+            Section {
+                ForEach(excludedSnippetApplications, id: \.self) { bundleID in
+                    HStack {
+                        Image(systemName: "app.dashed")
+                            .foregroundStyle(.secondary)
+                        Text(applicationName(for: bundleID))
+                        Spacer()
+                        Text(bundleID)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                        Button {
+                            removeExcludedApplication(bundleID)
+                        } label: {
+                            Image(systemName: "minus.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+                Button("Add Application…") { addExcludedApplication() }
+            } header: {
+                Text("Disabled Applications")
+            } footer: {
+                footerText {
+                    Text("Pace never expands in secure text fields. Keychain Access and common password managers are always excluded.")
+                }
             }
         }
         .formStyle(.grouped)
@@ -362,20 +479,53 @@ struct PreferencesView: View {
 
     private func finishRecording(_ shortcut: HotKeyShortcut?) {
         guard let shortcut else {
-            _ = AppRuntime.shared.updateHotKey(currentShortcut)
+            AppRuntime.shared.restoreHotKeys()
             return
         }
 
+        if shortcut == currentSnippetShortcut {
+            AppRuntime.shared.restoreHotKeys()
+            showShortcutConflict(with: "Show Snippets")
+            return
+        }
         if let taken = PanelAction.allCases.first(where: { panelShortcut(for: $0) == shortcut }) {
-            _ = AppRuntime.shared.updateHotKey(currentShortcut)
+            AppRuntime.shared.restoreHotKeys()
             showShortcutConflict(with: taken.title)
             return
         }
         if AppRuntime.shared.updateHotKey(shortcut) {
             hotKeyRawValue = shortcut.storedValue
+            AppRuntime.shared.restoreHotKeys()
             withAnimation(Self.quickFade) { shortcutMessage = nil }
         } else {
-            _ = AppRuntime.shared.updateHotKey(currentShortcut)
+            AppRuntime.shared.restoreHotKeys()
+            withAnimation(Self.quickFade) {
+                shortcutMessage = "That shortcut is already in use. Your previous shortcut is still active."
+            }
+        }
+    }
+
+    private func finishSnippetRecording(_ shortcut: HotKeyShortcut?) {
+        guard let shortcut else {
+            AppRuntime.shared.restoreHotKeys()
+            return
+        }
+        if shortcut == currentShortcut {
+            AppRuntime.shared.restoreHotKeys()
+            showShortcutConflict(with: "Show Clipboard")
+            return
+        }
+        if let taken = PanelAction.allCases.first(where: { panelShortcut(for: $0) == shortcut }) {
+            AppRuntime.shared.restoreHotKeys()
+            showShortcutConflict(with: taken.title)
+            return
+        }
+        if AppRuntime.shared.updateSnippetHotKey(shortcut) {
+            snippetHotKeyRawValue = shortcut.storedValue
+            AppRuntime.shared.restoreHotKeys()
+            withAnimation(Self.quickFade) { shortcutMessage = nil }
+        } else {
+            AppRuntime.shared.restoreHotKeys()
             withAnimation(Self.quickFade) {
                 shortcutMessage = "That shortcut is already in use. Your previous shortcut is still active."
             }
@@ -385,11 +535,15 @@ struct PreferencesView: View {
     // Recording suspends the global hotkey so pressing it doesn't toggle the
     // panel; every exit path must restore it.
     private func finishPanelRecording(for action: PanelAction, shortcut: HotKeyShortcut?) {
-        _ = AppRuntime.shared.updateHotKey(currentShortcut)
+        AppRuntime.shared.restoreHotKeys()
         guard let shortcut else { return }
 
         if shortcut == currentShortcut {
-            showShortcutConflict(with: "Show Pace")
+            showShortcutConflict(with: "Show Clipboard")
+            return
+        }
+        if shortcut == currentSnippetShortcut {
+            showShortcutConflict(with: "Show Snippets")
             return
         }
         if let taken = PanelAction.allCases.first(where: {
@@ -433,6 +587,44 @@ struct PreferencesView: View {
         }
     }
 
+    private func addExcludedApplication() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose an Application"
+        panel.prompt = "Exclude"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        guard panel.runModal() == .OK,
+              let url = panel.url,
+              let bundleID = Bundle(url: url)?.bundleIdentifier,
+              !excludedSnippetApplications.contains(bundleID) else { return }
+        excludedSnippetApplications.append(bundleID)
+        excludedSnippetApplications.sort()
+        persistExcludedApplications()
+    }
+
+    private func removeExcludedApplication(_ bundleID: String) {
+        excludedSnippetApplications.removeAll { $0 == bundleID }
+        persistExcludedApplications()
+    }
+
+    private func persistExcludedApplications() {
+        UserDefaults.standard.set(
+            excludedSnippetApplications,
+            forKey: SnippetExpansionPreferences.excludedBundleIDsKey
+        )
+        model.refreshSnippetExpansionSettings()
+    }
+
+    private func applicationName(for bundleID: String) -> String {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+            .flatMap { Bundle(url: $0)?.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String }
+            ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)?.deletingPathExtension().lastPathComponent
+            ?? bundleID
+    }
+
     private func load() {
         let policy = model.retentionPolicy
         unlimitedDays = policy.maximumAgeDays == nil
@@ -442,6 +634,9 @@ struct PreferencesView: View {
         items = policy.maximumItemCount.map(String.init) ?? "10000"
         storageMB = policy.maximumStorageBytes.map { String($0 / 1_000_000) } ?? "1000"
         protectsPinnedItems = policy.protectsPinnedItems
+        excludedSnippetApplications = UserDefaults.standard.stringArray(
+            forKey: SnippetExpansionPreferences.excludedBundleIDsKey
+        ) ?? []
         for action in PanelAction.allCases {
             panelShortcuts[action] = PanelShortcuts.shortcut(for: action)
         }

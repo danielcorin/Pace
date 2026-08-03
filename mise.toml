@@ -1,0 +1,6 @@
+[tools]
+xcodegen = "2.45.4"
+
+[env]
+# Load local notarization credentials without exposing their values in mise output.
+_.file = { path = ".env", redact = true }

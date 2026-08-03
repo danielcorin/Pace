@@ -9,15 +9,18 @@ final class AppRuntime {
     let model = AppModel()
     private lazy var panel = HistoryPanelCoordinator(model: model)
     private let hotKey = GlobalHotKey()
+    private let snippetHotKey = GlobalHotKey()
     private var socketServer: LocalSocketServer?
     private var started = false
 
     func start() {
         guard !started else { return }
         started = true
+        migrateDefaultHotKeysIfNeeded()
         model.start()
         Task { await model.unlock() }
         _ = updateHotKey(rawValue: UserDefaults.standard.string(forKey: "hotKeyChoice"))
+        _ = updateSnippetHotKey(rawValue: UserDefaults.standard.string(forKey: "snippetHotKeyChoice"))
 
         let server = LocalSocketServer { [model] request in
             await model.handle(request)
@@ -35,8 +38,8 @@ final class AppRuntime {
         socketServer = nil
     }
 
-    func togglePanel() { panel.toggle() }
-    func showPanel() { panel.show() }
+    func togglePanel(scope: PacePanelScope = .clipboard) { panel.toggle(scope: scope) }
+    func showPanel(scope: PacePanelScope = .clipboard) { panel.show(scope: scope) }
 
     @discardableResult
     func updateHotKey(rawValue: String?) -> Bool {
@@ -45,10 +48,66 @@ final class AppRuntime {
 
     @discardableResult
     func updateHotKey(_ shortcut: HotKeyShortcut) -> Bool {
-        hotKey.register(shortcut: shortcut) { [weak self] in self?.togglePanel() } == noErr
+        hotKey.register(shortcut: shortcut) { [weak self] in self?.togglePanel(scope: .clipboard) } == noErr
     }
 
-    func suspendHotKey() { hotKey.unregister() }
+    @discardableResult
+    func updateSnippetHotKey(rawValue: String?) -> Bool {
+        updateSnippetHotKey(HotKeyShortcut(storedValue: rawValue) ?? .defaultSnippetShortcut)
+    }
+
+    @discardableResult
+    func updateSnippetHotKey(_ shortcut: HotKeyShortcut) -> Bool {
+        snippetHotKey.register(shortcut: shortcut) { [weak self] in self?.togglePanel(scope: .snippets) } == noErr
+    }
+
+    func suspendHotKeys() {
+        hotKey.unregister()
+        snippetHotKey.unregister()
+    }
+
+    func restoreHotKeys() {
+        _ = updateHotKey(rawValue: UserDefaults.standard.string(forKey: "hotKeyChoice"))
+        _ = updateSnippetHotKey(rawValue: UserDefaults.standard.string(forKey: "snippetHotKeyChoice"))
+    }
+
+    private func migrateDefaultHotKeysIfNeeded() {
+        let defaults = UserDefaults.standard
+        let migrationKey = "hotKeyDefaultsVersion"
+        let version = defaults.integer(forKey: migrationKey)
+        guard version < 3 else { return }
+
+        // Version 3 corrects the first snippet build's reversed mapping and
+        // applies the explicitly requested defaults to the installed app.
+        if version >= 2 {
+            defaults.set(HotKeyShortcut.defaultShortcut.storedValue, forKey: "hotKeyChoice")
+            defaults.set(
+                HotKeyShortcut.defaultSnippetShortcut.storedValue,
+                forKey: "snippetHotKeyChoice"
+            )
+            defaults.set(3, forKey: migrationKey)
+            return
+        }
+
+        let clipboardRaw = defaults.string(forKey: "hotKeyChoice")
+        let clipboardShortcut = HotKeyShortcut(storedValue: clipboardRaw)
+        if clipboardRaw == nil || clipboardShortcut == .previousDefaultShortcut {
+            defaults.set(
+                HotKeyShortcut.defaultShortcut.storedValue,
+                forKey: "hotKeyChoice"
+            )
+        }
+
+        let snippetRaw = defaults.string(forKey: "snippetHotKeyChoice")
+        let snippetShortcut = HotKeyShortcut(storedValue: snippetRaw)
+        if snippetRaw == nil || snippetShortcut == .previousDefaultSnippetShortcut {
+            defaults.set(
+                HotKeyShortcut.defaultSnippetShortcut.storedValue,
+                forKey: "snippetHotKeyChoice"
+            )
+        }
+        defaults.set(3, forKey: migrationKey)
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -117,8 +176,9 @@ private struct MenuBarContent: View {
             Divider()
         }
 
-        Button("Show Pace") { AppRuntime.shared.showPanel() }
+        Button("Show Clipboard") { AppRuntime.shared.showPanel(scope: .clipboard) }
             .onAppear { model.refreshPermissions() }
+        Button("Show Snippets") { AppRuntime.shared.showPanel(scope: .snippets) }
 
         Divider()
 

@@ -69,6 +69,25 @@ struct PasteboardSnapshot: Sendable {
         return PasteboardSnapshot(representations: representations, source: source)
     }
 
+    @MainActor
+    func restore(to pasteboard: NSPasteboard = .general) {
+        pasteboard.clearContents()
+        let grouped = Dictionary(grouping: representations, by: \.itemIndex)
+        let items = grouped.keys.sorted().map { index -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for representation in grouped[index] ?? [] {
+                let type = NSPasteboard.PasteboardType(representation.typeIdentifier)
+                if type == .string, let string = String(data: representation.data, encoding: .utf8) {
+                    item.setString(string, forType: type)
+                } else {
+                    item.setData(representation.data, forType: type)
+                }
+            }
+            return item
+        }
+        pasteboard.writeObjects(items)
+    }
+
     func makeItem(now: Date = Date()) -> ClipboardItem {
         let kind = inferredKind
         let preview = inferredPreview(kind: kind)
