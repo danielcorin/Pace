@@ -17,6 +17,16 @@ public enum IPCCommand: String, Codable, Sendable {
     case retentionSet
     case retentionPreview
     case retentionPrune
+    case snippetList
+    case snippetSearch
+    case snippetGet
+    case snippetAdd
+    case snippetUpdate
+    case snippetDelete
+    case snippetCopy
+    case snippetPaste
+    case snippetRender
+    case snippetPromote
     case show
 }
 
@@ -44,6 +54,8 @@ public struct PaceStatus: Codable, Equatable, Sendable {
     public var isCapturePaused: Bool
     public var itemCount: Int?
     public var storageBytes: Int64?
+    public var snippetCount: Int?
+    public var isSnippetExpansionEnabled: Bool?
     public var retentionPolicy: RetentionPolicy
 
     public init(
@@ -51,12 +63,16 @@ public struct PaceStatus: Codable, Equatable, Sendable {
         isCapturePaused: Bool,
         itemCount: Int?,
         storageBytes: Int64?,
+        snippetCount: Int? = nil,
+        isSnippetExpansionEnabled: Bool? = nil,
         retentionPolicy: RetentionPolicy
     ) {
         self.isUnlocked = isUnlocked
         self.isCapturePaused = isCapturePaused
         self.itemCount = itemCount
         self.storageBytes = storageBytes
+        self.snippetCount = snippetCount
+        self.isSnippetExpansionEnabled = isSnippetExpansionEnabled
         self.retentionPolicy = retentionPolicy
     }
 }
@@ -68,6 +84,9 @@ public struct IPCResponse: Codable, Sendable {
     public var message: String?
     public var records: [ClipboardRecord]?
     public var item: ClipboardItem?
+    public var snippets: [Snippet]?
+    public var snippet: Snippet?
+    public var renderedSnippet: RenderedSnippet?
     public var status: PaceStatus?
     public var retentionPolicy: RetentionPolicy?
     public var retentionReport: RetentionReport?
@@ -79,6 +98,9 @@ public struct IPCResponse: Codable, Sendable {
         message: String? = nil,
         records: [ClipboardRecord]? = nil,
         item: ClipboardItem? = nil,
+        snippets: [Snippet]? = nil,
+        snippet: Snippet? = nil,
+        renderedSnippet: RenderedSnippet? = nil,
         status: PaceStatus? = nil,
         retentionPolicy: RetentionPolicy? = nil,
         retentionReport: RetentionReport? = nil
@@ -89,6 +111,9 @@ public struct IPCResponse: Codable, Sendable {
         self.message = message
         self.records = records
         self.item = item
+        self.snippets = snippets
+        self.snippet = snippet
+        self.renderedSnippet = renderedSnippet
         self.status = status
         self.retentionPolicy = retentionPolicy
         self.retentionReport = retentionReport

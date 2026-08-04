@@ -22,7 +22,7 @@ public struct SnippetRenderingContext: Sendable {
     }
 }
 
-public struct RenderedSnippet: Equatable, Sendable {
+public struct RenderedSnippet: Codable, Equatable, Sendable {
     public var text: String
     /// A grapheme-cluster offset from the beginning of `text`.
     public var cursorOffset: Int?

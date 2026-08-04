@@ -9,7 +9,7 @@ in the menu bar, opens searchable clipboard history with `Hyper+C` and a
 permanent snippet library with `Hyper+V`, then pastes the selected item straight
 into the app you were using. Copied images are OCR'd locally so their text is
 searchable and pasteable, and everything is encrypted at rest. A companion
-`pace` CLI exposes clipboard history to scripts and agents.
+`pace` CLI exposes clipboard history and snippets to scripts and agents.
 
 ## Features
 
@@ -101,6 +101,18 @@ pace get ITEM_ID --output exported-item
 pace pin ITEM_ID
 pace delete ITEM_ID
 
+pace show --mode snippets
+pace snippets list
+pace snippets search email
+pace snippets get ';em'
+pace snippets add 'Email' 'person@example.com' --keyword ';em'
+pace snippets update ';em' --template 'new@example.com'
+pace snippets render ';em'
+pace snippets validate '{datetime format=iso8601}'
+pace snippets copy ';em'
+pace snippets paste ';em'
+pace snippets promote CLIPBOARD_ITEM_ID --name 'Email' --keyword ';em' --expand
+
 pace retention show
 pace retention preview
 pace retention set --days 30 --max-items 10000 --max-storage 1GB --prune
@@ -108,9 +120,13 @@ pace retention set --days 30 --max-items 10000 --max-storage 1GB --prune
 
 The CLI launches the menu-bar service when needed, and the vault unlocks
 automatically. Search supports `type:`, `app:`, `is:pinned`, and `has:ocr`
-filters. List, search, and get commands can return JSON. `pace add` accepts
-text, piped input, or a file, plus `--timestamp`, `--source-kind`, and
-`--session` metadata so imports and agent workflows can preserve context.
+filters. Clipboard and snippet commands can return JSON. Snippets can be
+addressed by full or unique-prefix UUID, exact keyword, or case-insensitive
+name. Snippet templates may be positional, piped on stdin, or read with
+`--template`/`--file`; render and validate resolve contextual variables using
+the same live clipboard and snippet catalog as the app. `pace add` accepts text,
+piped input, or a file, plus `--timestamp`, `--source-kind`, and `--session`
+metadata so imports and agent workflows can preserve context.
 
 ### Importing from Alfred
 

@@ -402,14 +402,7 @@ final class AppModel: ObservableObject {
 
     func pasteSnippet(_ snippet: Snippet, into target: NSRunningApplication?) async {
         do {
-            let rendered = try await renderSnippet(snippet)
-            try await pasteRenderedSnippet(
-                rendered,
-                into: target,
-                restoresClipboard: SnippetExpansionPreferences.restoresClipboard
-            )
-            _ = try await snippetStore.recordUse(id: snippet.id)
-            await refreshSnippets()
+            _ = try await performPasteSnippet(snippet, into: target)
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -417,19 +410,39 @@ final class AppModel: ObservableObject {
 
     func copySnippet(_ snippet: Snippet) async {
         do {
-            let rendered = try await renderSnippet(snippet)
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(rendered.text, forType: .string)
-            monitor.acknowledgeCurrentClipboard()
-            _ = try await store.add(snippetOutputItem(rendered.text, snippet: snippet))
-            _ = try await snippetStore.recordUse(id: snippet.id)
-            await refresh()
-            await refreshSnippets()
+            _ = try await performCopySnippet(snippet)
             statusMessage = "Copied"
         } catch {
             statusMessage = error.localizedDescription
         }
+    }
+
+    private func performPasteSnippet(
+        _ snippet: Snippet,
+        into target: NSRunningApplication?
+    ) async throws -> RenderedSnippet {
+        let rendered = try await renderSnippet(snippet)
+        try await pasteRenderedSnippet(
+            rendered,
+            into: target,
+            restoresClipboard: SnippetExpansionPreferences.restoresClipboard
+        )
+        _ = try await snippetStore.recordUse(id: snippet.id)
+        await refreshSnippets()
+        return rendered
+    }
+
+    private func performCopySnippet(_ snippet: Snippet) async throws -> RenderedSnippet {
+        let rendered = try await renderSnippet(snippet)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(rendered.text, forType: .string)
+        monitor.acknowledgeCurrentClipboard()
+        _ = try await store.add(snippetOutputItem(rendered.text, snippet: snippet))
+        _ = try await snippetStore.recordUse(id: snippet.id)
+        await refresh()
+        await refreshSnippets()
+        return rendered
     }
 
     func updateRetention(_ policy: RetentionPolicy, pruneImmediately: Bool) async -> RetentionReport? {
@@ -580,6 +593,9 @@ final class AppModel: ObservableObject {
             case .status:
                 let policy = await store.retentionPolicy()
                 let summary = vaultState == .unlocked ? try await store.storageSummary() : nil
+                let snippetCount = vaultState == .unlocked
+                    ? try await snippetStore.all(limit: 10_000).count
+                    : nil
                 return IPCResponse(
                     id: request.id,
                     success: true,
@@ -588,6 +604,8 @@ final class AppModel: ObservableObject {
                         isCapturePaused: capturePaused,
                         itemCount: summary?.items,
                         storageBytes: summary?.bytes,
+                        snippetCount: snippetCount,
+                        isSnippetExpansionEnabled: SnippetExpansionPreferences.isEnabled,
                         retentionPolicy: policy
                     )
                 )
@@ -693,9 +711,106 @@ final class AppModel: ObservableObject {
                 await refresh()
                 return IPCResponse(id: request.id, success: true, retentionReport: report)
 
+            case .snippetList, .snippetSearch:
+                let query = request.command == .snippetSearch
+                    ? request.arguments["query"] ?? ""
+                    : ""
+                let limit = Int(request.arguments["limit"] ?? "100") ?? 100
+                let found = try await snippetStore.all(query: query, limit: limit)
+                return IPCResponse(id: request.id, success: true, snippets: found)
+
+            case .snippetGet:
+                return IPCResponse(
+                    id: request.id,
+                    success: true,
+                    snippet: try await resolvedSnippet(from: request)
+                )
+
+            case .snippetAdd:
+                let saved = try await validateAndSaveSnippet(makeCommandLineSnippet(from: request))
+                return IPCResponse(
+                    id: request.id,
+                    success: true,
+                    message: "Snippet created.",
+                    snippet: saved
+                )
+
+            case .snippetUpdate:
+                let existing = try await resolvedSnippet(from: request)
+                let saved = try await validateAndSaveSnippet(
+                    applyingSnippetChanges(from: request, to: existing)
+                )
+                return IPCResponse(
+                    id: request.id,
+                    success: true,
+                    message: "Snippet updated.",
+                    snippet: saved
+                )
+
+            case .snippetDelete:
+                let snippet = try await resolvedSnippet(from: request)
+                try await snippetStore.delete(id: snippet.id)
+                await refreshSnippets()
+                restartExpansionMonitor()
+                return IPCResponse(id: request.id, success: true, message: "Snippet deleted.")
+
+            case .snippetCopy:
+                let snippet = try await resolvedSnippet(from: request)
+                let rendered = try await performCopySnippet(snippet)
+                return IPCResponse(
+                    id: request.id,
+                    success: true,
+                    message: "Snippet copied.",
+                    snippet: try await snippetStore.snippet(id: snippet.id),
+                    renderedSnippet: rendered
+                )
+
+            case .snippetPaste:
+                let snippet = try await resolvedSnippet(from: request)
+                let target = NSWorkspace.shared.frontmostApplication
+                let rendered = try await performPasteSnippet(snippet, into: target)
+                return IPCResponse(
+                    id: request.id,
+                    success: true,
+                    message: "Snippet pasted.",
+                    snippet: try await snippetStore.snippet(id: snippet.id),
+                    renderedSnippet: rendered
+                )
+
+            case .snippetRender:
+                let rendered: RenderedSnippet
+                if let template = try commandLineSnippetTemplate(from: request, required: false) {
+                    rendered = try SnippetTemplateRenderer.render(
+                        template,
+                        context: try await snippetRenderingContext()
+                    )
+                } else {
+                    rendered = try await renderSnippet(try await resolvedSnippet(from: request))
+                }
+                return IPCResponse(id: request.id, success: true, renderedSnippet: rendered)
+
+            case .snippetPromote:
+                let saved = try await promoteClipboardItemToSnippet(from: request)
+                return IPCResponse(
+                    id: request.id,
+                    success: true,
+                    message: "Clipboard item promoted to a snippet.",
+                    snippet: saved
+                )
+
             case .show:
-                AppRuntime.shared.showPanel()
-                return IPCResponse(id: request.id, success: true, message: "Pace panel opened.")
+                let scope: PacePanelScope
+                switch request.arguments["scope"]?.lowercased() {
+                case nil, "", "clipboard": scope = .clipboard
+                case "snippet", "snippets": scope = .snippets
+                default: throw PaceError.invalidArgument("--mode must be clipboard or snippets.")
+                }
+                AppRuntime.shared.showPanel(scope: scope)
+                return IPCResponse(
+                    id: request.id,
+                    success: true,
+                    message: "Pace \(scope.title.lowercased()) opened."
+                )
             }
         } catch {
             return IPCResponse.failure(id: request.id, error: error)
@@ -942,6 +1057,180 @@ final class AppModel: ObservableObject {
         up.flags = flags
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
+    }
+
+    private func resolvedSnippet(from request: IPCRequest) async throws -> Snippet {
+        guard let identifier = request.arguments["identifier"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !identifier.isEmpty else {
+            throw PaceError.invalidArgument("A snippet ID, name, or keyword is required.")
+        }
+        if let id = UUID(uuidString: identifier) {
+            return try await snippetStore.snippet(id: id)
+        }
+
+        let allSnippets = try await snippetStore.all(limit: 10_000)
+        let lowercaseIdentifier = identifier.lowercased()
+        let prefixMatches = allSnippets.filter {
+            $0.id.uuidString.lowercased().hasPrefix(lowercaseIdentifier)
+        }
+        if prefixMatches.count == 1, let match = prefixMatches.first { return match }
+        if prefixMatches.count > 1 {
+            throw PaceError.invalidArgument("The snippet ID prefix “\(identifier)” is ambiguous.")
+        }
+        if let match = allSnippets.first(where: { $0.keyword == identifier }) { return match }
+        if let match = allSnippets.first(where: {
+            $0.name.compare(
+                identifier,
+                options: [.caseInsensitive, .diacriticInsensitive]
+            ) == .orderedSame
+        }) {
+            return match
+        }
+        throw PaceError.notFound("Snippet “\(identifier)” was not found.")
+    }
+
+    private func makeCommandLineSnippet(from request: IPCRequest) throws -> Snippet {
+        guard let name = request.arguments["name"] else {
+            throw PaceError.invalidArgument("A snippet name is required.")
+        }
+        let keyword = request.arguments["keyword"]
+        return Snippet(
+            name: name,
+            template: try commandLineSnippetTemplate(from: request, required: true) ?? "",
+            keyword: keyword,
+            tags: snippetTags(from: request.arguments["tags"]),
+            isPinned: try commandLineBoolean(
+                request.arguments["isPinned"],
+                default: false,
+                name: "isPinned"
+            ),
+            isExpansionEnabled: try commandLineBoolean(
+                request.arguments["isExpansionEnabled"],
+                default: keyword != nil,
+                name: "isExpansionEnabled"
+            )
+        )
+    }
+
+    private func applyingSnippetChanges(
+        from request: IPCRequest,
+        to existing: Snippet
+    ) throws -> Snippet {
+        var snippet = existing
+        if let name = request.arguments["name"] { snippet.name = name }
+        if let template = try commandLineSnippetTemplate(from: request, required: false) {
+            snippet.template = template
+        }
+        if request.arguments["clearKeyword"] == "true" {
+            snippet.keyword = nil
+            snippet.isExpansionEnabled = false
+        } else if let keyword = request.arguments["keyword"] {
+            snippet.keyword = keyword
+        }
+        if request.arguments["clearTags"] == "true" {
+            snippet.tags = []
+        } else if let tags = request.arguments["tags"] {
+            snippet.tags = snippetTags(from: tags)
+        }
+        if let pinned = request.arguments["isPinned"] {
+            snippet.isPinned = try commandLineBoolean(pinned, default: snippet.isPinned, name: "isPinned")
+        }
+        if let expansion = request.arguments["isExpansionEnabled"] {
+            snippet.isExpansionEnabled = try commandLineBoolean(
+                expansion,
+                default: snippet.isExpansionEnabled,
+                name: "isExpansionEnabled"
+            )
+        }
+        return snippet
+    }
+
+    private func commandLineSnippetTemplate(
+        from request: IPCRequest,
+        required: Bool
+    ) throws -> String? {
+        guard let input = request.input else {
+            if required { throw PaceError.invalidArgument("Snippet template text is required.") }
+            return nil
+        }
+        guard let template = String(data: input, encoding: .utf8) else {
+            throw PaceError.invalidArgument("Snippet template text must be UTF-8.")
+        }
+        return template
+    }
+
+    private func snippetTags(from rawValue: String?) -> [String] {
+        guard let rawValue else { return [] }
+        return rawValue.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+    }
+
+    private func commandLineBoolean(
+        _ rawValue: String?,
+        default defaultValue: Bool,
+        name: String
+    ) throws -> Bool {
+        guard let rawValue else { return defaultValue }
+        switch rawValue.lowercased() {
+        case "true", "1", "yes": return true
+        case "false", "0", "no": return false
+        default: throw PaceError.invalidArgument("Invalid boolean value for \(name): \(rawValue).")
+        }
+    }
+
+    private func validateAndSaveSnippet(_ snippet: Snippet) async throws -> Snippet {
+        do {
+            _ = try SnippetTemplateRenderer.render(
+                snippet.template,
+                context: try await snippetRenderingContext()
+            )
+        } catch PaceError.notFound {
+            // Clipboard offsets and nested references may become available
+            // later; retain templates that are otherwise syntactically valid.
+        }
+        let saved = try await snippetStore.upsert(snippet)
+        await refreshSnippets()
+        restartExpansionMonitor()
+        return saved
+    }
+
+    private func promoteClipboardItemToSnippet(from request: IPCRequest) async throws -> Snippet {
+        guard let value = request.arguments["clipboardID"],
+              let id = UUID(uuidString: value) else {
+            throw PaceError.invalidArgument("A full clipboard item UUID is required.")
+        }
+        let allSnippets = try await snippetStore.all(limit: 10_000)
+        if let existing = allSnippets.first(where: { $0.sourceRecordID == id }) {
+            return try await validateAndSaveSnippet(
+                applyingSnippetChanges(from: request, to: existing)
+            )
+        }
+
+        let item = try await store.item(id: id)
+        guard let text = item.plainText ?? item.ocrText, !text.isEmpty else {
+            throw PaceError.invalidArgument(
+                "This clipboard item does not contain text that can become a snippet."
+            )
+        }
+        let record = ClipboardRecord(item: item)
+        let baseName = suggestedSnippetName(for: text, record: record)
+        let existingNames = Set(allSnippets.map { $0.name.lowercased() })
+        var name = baseName
+        var suffix = 2
+        while existingNames.contains(name.lowercased()) {
+            name = "\(baseName) \(suffix)"
+            suffix += 1
+        }
+        let proposed = Snippet(
+            name: name,
+            template: text,
+            keyword: nil,
+            isExpansionEnabled: false,
+            sourceRecordID: id
+        )
+        return try await validateAndSaveSnippet(
+            applyingSnippetChanges(from: request, to: proposed)
+        )
     }
 
     private func itemID(from request: IPCRequest) throws -> UUID {

@@ -104,6 +104,12 @@ struct PaceCLI {
 PaceCLI.main()
 
 private struct Command {
+    private static let booleanOptions: Set<String> = [
+        "--clear-keyword", "--clear-tags", "--expand", "--include-pinned",
+        "--json", "--no-expand", "--ocr-text", "--pin", "--pinned", "--plain",
+        "--protect-pinned", "--prune", "--snippets", "--unpin"
+    ]
+
     let name: String
     let values: [String]
     let options: [String: String]
@@ -125,7 +131,10 @@ private struct Command {
         while index < arguments.count {
             let argument = arguments[index]
             if argument.hasPrefix("--") {
-                if index + 1 < arguments.count, !arguments[index + 1].hasPrefix("--") {
+                if Self.booleanOptions.contains(argument) {
+                    flags.insert(argument)
+                    index += 1
+                } else if index + 1 < arguments.count, !arguments[index + 1].hasPrefix("--") {
                     options[argument] = arguments[index + 1]
                     index += 2
                 } else {
@@ -148,7 +157,9 @@ private struct Command {
             case "help", "--help", "-h":
                 return IPCRequest(command: .status, arguments: ["help": "true"])
             case "status": return IPCRequest(command: .status)
-            case "show": return IPCRequest(command: .show)
+            case "show":
+                let scope = flags.contains("--snippets") ? "snippets" : options["--mode"]
+                return IPCRequest(command: .show, arguments: scope.map { ["scope": $0] } ?? [:])
             case "unlock": return IPCRequest(command: .unlock)
             case "lock": return IPCRequest(command: .lock)
             case "list":
@@ -186,6 +197,7 @@ private struct Command {
                     arguments: ["id": try requiredID(), "value": name == "pin" ? "true" : "false"]
                 )
             case "retention": return try retentionRequest()
+            case "snippet", "snippets": return try snippetRequest()
             default:
                 throw PaceError.invalidArgument("Unknown command '\(name)'. Run `pace help` for usage.")
             }
@@ -222,6 +234,52 @@ private struct Command {
             if let bytes = status.storageBytes {
                 Swift.print("Storage: \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))")
             }
+            if let snippetCount = status.snippetCount { Swift.print("Snippets: \(snippetCount)") }
+            if let enabled = status.isSnippetExpansionEnabled {
+                Swift.print("Expansion: \(enabled ? "enabled" : "disabled")")
+            }
+            return
+        }
+
+        if let snippets = response.snippets {
+            for snippet in snippets {
+                let keyword = snippet.keyword ?? "-"
+                let state = [
+                    snippet.isPinned ? "pinned" : nil,
+                    snippet.isExpansionEnabled ? "expands" : nil
+                ].compactMap { $0 }.joined(separator: ",")
+                let flags = state.isEmpty ? "-" : state
+                let preview = snippet.template
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .prefixString(100)
+                Swift.print("\(snippet.id.uuidString)\t\(keyword)\t\(flags)\t\(snippet.name)\t\(preview)")
+            }
+            return
+        }
+
+        let snippetOperation = (name == "snippet" || name == "snippets") ? values.first : nil
+        if let rendered = response.renderedSnippet,
+           snippetOperation == "render" || snippetOperation == "validate" {
+            FileHandle.standardOutput.write(Data(rendered.text.utf8))
+            if !rendered.text.hasSuffix("\n") { FileHandle.standardOutput.write(Data("\n".utf8)) }
+            return
+        }
+
+        if let snippet = response.snippet {
+            if snippetOperation == "copy" || snippetOperation == "paste" {
+                if let message = response.message { Swift.print(message) }
+                return
+            }
+            Swift.print("ID: \(snippet.id.uuidString)")
+            Swift.print("Name: \(snippet.name)")
+            Swift.print("Keyword: \(snippet.keyword ?? "none")")
+            Swift.print("Tags: \(snippet.tags.isEmpty ? "none" : snippet.tags.joined(separator: ", "))")
+            Swift.print("Pinned: \(snippet.isPinned ? "yes" : "no")")
+            Swift.print("Expansion: \(snippet.isExpansionEnabled ? "enabled" : "disabled")")
+            Swift.print("Uses: \(snippet.useCount)")
+            Swift.print("Template:")
+            FileHandle.standardOutput.write(Data(snippet.template.utf8))
+            if !snippet.template.hasSuffix("\n") { FileHandle.standardOutput.write(Data("\n".utf8)) }
             return
         }
 
@@ -295,6 +353,140 @@ private struct Command {
         return (data, options["--type"] ?? "public.utf8-plain-text")
     }
 
+    private func snippetRequest() throws -> IPCRequest {
+        guard let operation = values.first else {
+            throw PaceError.invalidArgument(
+                "Usage: pace snippets list|search|get|add|update|delete|render|validate|copy|paste|promote"
+            )
+        }
+        switch operation {
+        case "list":
+            return IPCRequest(
+                command: .snippetList,
+                arguments: ["limit": options["--limit"] ?? "100"]
+            )
+        case "search":
+            let query = values.dropFirst().joined(separator: " ")
+            guard !query.isEmpty else {
+                throw PaceError.invalidArgument("Usage: pace snippets search <query>")
+            }
+            return IPCRequest(
+                command: .snippetSearch,
+                arguments: ["query": query, "limit": options["--limit"] ?? "100"]
+            )
+        case "get", "delete", "copy", "paste", "render":
+            let identifier = try requiredSnippetIdentifier(for: operation)
+            let command: IPCCommand
+            switch operation {
+            case "get": command = .snippetGet
+            case "delete": command = .snippetDelete
+            case "copy": command = .snippetCopy
+            case "paste": command = .snippetPaste
+            default: command = .snippetRender
+            }
+            return IPCRequest(command: command, arguments: ["identifier": identifier])
+        case "add":
+            guard values.count >= 2 else {
+                throw PaceError.invalidArgument("Usage: pace snippets add <name> --template <text>")
+            }
+            var arguments = try snippetMutationArguments()
+            arguments["name"] = values[1]
+            return IPCRequest(
+                command: .snippetAdd,
+                arguments: arguments,
+                input: try snippetTemplateInput(positionalStart: 2, required: true)
+            )
+        case "update":
+            guard values.count >= 2 else {
+                throw PaceError.invalidArgument("Usage: pace snippets update <id|name|keyword> [options]")
+            }
+            var arguments = try snippetMutationArguments()
+            arguments["identifier"] = values[1]
+            return IPCRequest(
+                command: .snippetUpdate,
+                arguments: arguments,
+                input: try snippetTemplateInput(positionalStart: 2, required: false)
+            )
+        case "validate":
+            return IPCRequest(
+                command: .snippetRender,
+                input: try snippetTemplateInput(positionalStart: 1, required: true)
+            )
+        case "promote":
+            guard values.count >= 2, UUID(uuidString: values[1]) != nil else {
+                throw PaceError.invalidArgument("Usage: pace snippets promote <clipboard-item-id> [options]")
+            }
+            var arguments = try snippetMutationArguments()
+            arguments["clipboardID"] = values[1]
+            return IPCRequest(command: .snippetPromote, arguments: arguments)
+        case "show":
+            return IPCRequest(command: .show, arguments: ["scope": "snippets"])
+        default:
+            throw PaceError.invalidArgument("Unknown snippets operation '\(operation)'.")
+        }
+    }
+
+    private func requiredSnippetIdentifier(for operation: String) throws -> String {
+        let identifier = values.dropFirst().joined(separator: " ")
+        guard !identifier.isEmpty else {
+            throw PaceError.invalidArgument("Usage: pace snippets \(operation) <id|name|keyword>")
+        }
+        return identifier
+    }
+
+    private func snippetMutationArguments() throws -> [String: String] {
+        var arguments: [String: String] = [:]
+        arguments["name"] = options["--name"]
+        arguments["keyword"] = options["--keyword"]
+        arguments["tags"] = options["--tags"]
+        if flags.contains("--clear-keyword") { arguments["clearKeyword"] = "true" }
+        if flags.contains("--clear-tags") { arguments["clearTags"] = "true" }
+
+        let wantsPin = flags.contains("--pin") || flags.contains("--pinned")
+        let wantsUnpin = flags.contains("--unpin")
+        guard !(wantsPin && wantsUnpin) else {
+            throw PaceError.invalidArgument("Use either --pin or --unpin, not both.")
+        }
+        if wantsPin { arguments["isPinned"] = "true" }
+        if wantsUnpin { arguments["isPinned"] = "false" }
+
+        let wantsExpansion = flags.contains("--expand")
+        let disablesExpansion = flags.contains("--no-expand")
+        guard !(wantsExpansion && disablesExpansion) else {
+            throw PaceError.invalidArgument("Use either --expand or --no-expand, not both.")
+        }
+        if wantsExpansion { arguments["isExpansionEnabled"] = "true" }
+        if disablesExpansion { arguments["isExpansionEnabled"] = "false" }
+        return arguments
+    }
+
+    private func snippetTemplateInput(positionalStart: Int, required: Bool) throws -> Data? {
+        var sources: [Data] = []
+        if let template = options["--template"] { sources.append(Data(template.utf8)) }
+        if let path = options["--file"] {
+            sources.append(try Data(contentsOf: URL(fileURLWithPath: path)))
+        }
+        if values.count > positionalStart {
+            sources.append(Data(values.dropFirst(positionalStart).joined(separator: " ").utf8))
+        }
+        if sources.isEmpty, isatty(STDIN_FILENO) == 0 {
+            let piped = FileHandle.standardInput.readDataToEndOfFile()
+            if !piped.isEmpty { sources.append(piped) }
+        }
+        guard sources.count <= 1 else {
+            throw PaceError.invalidArgument(
+                "Provide snippet text once using a positional value, --template, --file, or stdin."
+            )
+        }
+        if let source = sources.first { return source }
+        if required {
+            throw PaceError.invalidArgument(
+                "Snippet template text is required; use --template, --file, a positional value, or stdin."
+            )
+        }
+        return nil
+    }
+
     private func retentionRequest() throws -> IPCRequest {
         guard let operation = values.first else {
             throw PaceError.invalidArgument("Usage: pace retention show|set|preview|prune")
@@ -338,11 +530,11 @@ private struct Command {
     }
 
     private static let help = """
-    Pace — encrypted clipboard history
+    Pace — encrypted clipboard and snippet manager
 
     Usage:
       pace status|unlock|lock
-      pace show
+      pace show [--mode clipboard|snippets]
       pace list [--limit N] [--json]
       pace search <query> [--limit N] [--json]
       pace get <id> [--ocr-text|--output PATH] [--json]
@@ -356,5 +548,27 @@ private struct Command {
       pace retention show|preview|prune
       pace retention set [--days N|unlimited] [--max-items N|unlimited]
                          [--max-storage 1GB|unlimited] [--prune]
+
+      pace snippets show
+      pace snippets list [--limit N] [--json]
+      pace snippets search <query> [--limit N] [--json]
+      pace snippets get <id|name|keyword> [--json]
+      pace snippets add <name> <template> [--keyword KEY] [--tags a,b]
+                        [--pin] [--no-expand] [--json]
+      pace snippets add <name> --template TEXT|--file PATH [options]
+      command | pace snippets add <name> [options]
+      pace snippets update <id|name|keyword> [--name NAME]
+                           [--template TEXT|--file PATH] [--keyword KEY|--clear-keyword]
+                           [--tags a,b|--clear-tags] [--pin|--unpin]
+                           [--expand|--no-expand] [--json]
+      pace snippets render <id|name|keyword> [--json]
+      pace snippets validate <template>|--template TEXT|--file PATH [--json]
+      pace snippets copy|paste|delete <id|name|keyword> [--json]
+      pace snippets promote <clipboard-item-id> [--name NAME] [--keyword KEY]
+                            [--tags a,b] [--pin] [--expand] [--json]
+
+    Snippets can be addressed by full or unique-prefix UUID, exact keyword,
+    or case-insensitive name. Template input may be positional, piped on stdin,
+    or supplied with --template/--file.
     """
 }
