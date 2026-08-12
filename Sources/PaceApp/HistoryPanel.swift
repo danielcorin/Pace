@@ -1638,6 +1638,12 @@ private struct DetailPane: View {
             infoRow("Size", panelByteFormatter.string(fromByteCount: record.byteCount))
             infoRow("Times copied", "\(record.copyCount)")
             infoRow("Last copied", record.lastCopiedAt.formatted(date: .abbreviated, time: .shortened))
+            if record.useCount > 0 {
+                infoRow("Times used in Pace", "\(record.useCount)")
+                if let lastUsedAt = record.lastUsedAt {
+                    infoRow("Last used in Pace", lastUsedAt.formatted(date: .abbreviated, time: .shortened))
+                }
+            }
             if canSaveAsSnippet(record) {
                 Divider().padding(.vertical, 2)
                 HStack {

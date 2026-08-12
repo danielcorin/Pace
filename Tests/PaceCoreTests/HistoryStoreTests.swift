@@ -35,6 +35,49 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertNil(String(data: catalog, encoding: .utf8)?.range(of: "hello"))
     }
 
+    func testRecordUsePersistsWithoutChangingCopyMetadata() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PaceTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let key = SymmetricKey(size: .bits256)
+        let store = HistoryStore(rootURL: root)
+        try await store.unlock(with: key)
+        let copiedAt = Date()
+        let usedAt = copiedAt.addingTimeInterval(100)
+        let added = try await store.add(
+            ClipboardItem(
+                createdAt: copiedAt,
+                lastCopiedAt: copiedAt,
+                source: ClipboardSource(kind: .application, name: "Tests"),
+                kind: .text,
+                representations: [],
+                preview: "hello",
+                searchableText: "hello",
+                fingerprint: "used",
+                byteCount: 5
+            )
+        )
+
+        let used = try await store.recordUse(id: added.id, at: usedAt)
+        XCTAssertEqual(used.useCount, 1)
+        XCTAssertEqual(used.lastUsedAt, usedAt)
+        XCTAssertEqual(used.copyCount, 1)
+        XCTAssertEqual(used.lastCopiedAt.timeIntervalSince(copiedAt), 0, accuracy: 0.005)
+        await store.lock()
+
+        let reopened = HistoryStore(rootURL: root)
+        try await reopened.unlock(with: key)
+        let persisted = try await reopened.item(id: added.id)
+        XCTAssertEqual(persisted.useCount, 1)
+        XCTAssertEqual(
+            try XCTUnwrap(persisted.lastUsedAt).timeIntervalSince(usedAt),
+            0,
+            accuracy: 0.005
+        )
+        XCTAssertEqual(persisted.copyCount, 1)
+        XCTAssertEqual(persisted.lastCopiedAt.timeIntervalSince(copiedAt), 0, accuracy: 0.005)
+    }
+
     func testSameContentFromDifferentCapturePathsDeduplicates() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("PaceTests-\(UUID().uuidString)", isDirectory: true)
@@ -106,6 +149,43 @@ final class HistoryStoreTests: XCTestCase {
             parsed.date,
             ISO8601DateFormatter().date(from: "2026-07-17T15:08:33Z")
         )
+    }
+
+    func testClipboardUsageDefaultsWhenDecodingLegacyData() throws {
+        let item = ClipboardItem(
+            source: ClipboardSource(kind: .application, name: "Tests"),
+            kind: .text,
+            representations: [],
+            preview: "legacy",
+            searchableText: "legacy",
+            fingerprint: "legacy",
+            byteCount: 6
+        )
+        var itemJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder.pace.encode(item)) as? [String: Any]
+        )
+        itemJSON.removeValue(forKey: "lastUsedAt")
+        itemJSON.removeValue(forKey: "useCount")
+        let decodedItem = try JSONDecoder.pace.decode(
+            ClipboardItem.self,
+            from: JSONSerialization.data(withJSONObject: itemJSON)
+        )
+        XCTAssertEqual(decodedItem.useCount, 0)
+        XCTAssertNil(decodedItem.lastUsedAt)
+
+        var recordJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder.pace.encode(ClipboardRecord(item: item))
+            ) as? [String: Any]
+        )
+        recordJSON.removeValue(forKey: "lastUsedAt")
+        recordJSON.removeValue(forKey: "useCount")
+        let decodedRecord = try JSONDecoder.pace.decode(
+            ClipboardRecord.self,
+            from: JSONSerialization.data(withJSONObject: recordJSON)
+        )
+        XCTAssertEqual(decodedRecord.useCount, 0)
+        XCTAssertNil(decodedRecord.lastUsedAt)
     }
 
     func testOCRTextPreservesReadingLines() {

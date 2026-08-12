@@ -85,6 +85,8 @@ public struct ClipboardItem: Codable, Identifiable, Equatable, Sendable {
     public var fingerprint: String
     public var byteCount: Int64
     public var copyCount: Int
+    public var lastUsedAt: Date?
+    public var useCount: Int
     public var isPinned: Bool
     public var ocrObservations: [OCRObservation]
 
@@ -100,6 +102,8 @@ public struct ClipboardItem: Codable, Identifiable, Equatable, Sendable {
         fingerprint: String,
         byteCount: Int64,
         copyCount: Int = 1,
+        lastUsedAt: Date? = nil,
+        useCount: Int = 0,
         isPinned: Bool = false,
         ocrObservations: [OCRObservation] = []
     ) {
@@ -114,8 +118,47 @@ public struct ClipboardItem: Codable, Identifiable, Equatable, Sendable {
         self.fingerprint = fingerprint
         self.byteCount = byteCount
         self.copyCount = copyCount
+        self.lastUsedAt = lastUsedAt
+        self.useCount = useCount
         self.isPinned = isPinned
         self.ocrObservations = ocrObservations
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case createdAt
+        case lastCopiedAt
+        case source
+        case kind
+        case representations
+        case preview
+        case searchableText
+        case fingerprint
+        case byteCount
+        case copyCount
+        case lastUsedAt
+        case useCount
+        case isPinned
+        case ocrObservations
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+        lastCopiedAt = try values.decode(Date.self, forKey: .lastCopiedAt)
+        source = try values.decode(ClipboardSource.self, forKey: .source)
+        kind = try values.decode(ClipboardContentKind.self, forKey: .kind)
+        representations = try values.decode([ClipboardRepresentation].self, forKey: .representations)
+        preview = try values.decode(String.self, forKey: .preview)
+        searchableText = try values.decode(String.self, forKey: .searchableText)
+        fingerprint = try values.decode(String.self, forKey: .fingerprint)
+        byteCount = try values.decode(Int64.self, forKey: .byteCount)
+        copyCount = try values.decode(Int.self, forKey: .copyCount)
+        lastUsedAt = try values.decodeIfPresent(Date.self, forKey: .lastUsedAt)
+        useCount = try values.decodeIfPresent(Int.self, forKey: .useCount) ?? 0
+        isPinned = try values.decode(Bool.self, forKey: .isPinned)
+        ocrObservations = try values.decode([OCRObservation].self, forKey: .ocrObservations)
     }
 
     public var plainText: String? {
@@ -178,6 +221,8 @@ public struct ClipboardRecord: Codable, Identifiable, Equatable, Sendable {
     public var fingerprint: String
     public var byteCount: Int64
     public var copyCount: Int
+    public var lastUsedAt: Date?
+    public var useCount: Int
     public var isPinned: Bool
     public var hasOCR: Bool
 
@@ -192,7 +237,44 @@ public struct ClipboardRecord: Codable, Identifiable, Equatable, Sendable {
         fingerprint = item.fingerprint
         byteCount = item.byteCount
         copyCount = item.copyCount
+        lastUsedAt = item.lastUsedAt
+        useCount = item.useCount
         isPinned = item.isPinned
         hasOCR = !item.ocrObservations.isEmpty
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case createdAt
+        case lastCopiedAt
+        case source
+        case kind
+        case preview
+        case searchableText
+        case fingerprint
+        case byteCount
+        case copyCount
+        case lastUsedAt
+        case useCount
+        case isPinned
+        case hasOCR
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+        lastCopiedAt = try values.decode(Date.self, forKey: .lastCopiedAt)
+        source = try values.decode(ClipboardSource.self, forKey: .source)
+        kind = try values.decode(ClipboardContentKind.self, forKey: .kind)
+        preview = try values.decode(String.self, forKey: .preview)
+        searchableText = try values.decode(String.self, forKey: .searchableText)
+        fingerprint = try values.decode(String.self, forKey: .fingerprint)
+        byteCount = try values.decode(Int64.self, forKey: .byteCount)
+        copyCount = try values.decode(Int.self, forKey: .copyCount)
+        lastUsedAt = try values.decodeIfPresent(Date.self, forKey: .lastUsedAt)
+        useCount = try values.decodeIfPresent(Int.self, forKey: .useCount) ?? 0
+        isPinned = try values.decode(Bool.self, forKey: .isPinned)
+        hasOCR = try values.decode(Bool.self, forKey: .hasOCR)
     }
 }

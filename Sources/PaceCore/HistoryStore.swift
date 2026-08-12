@@ -2,11 +2,11 @@ import CryptoKit
 import Foundation
 
 public actor HistoryStore {
-    // Version 2: fingerprints are content-based (ClipboardItem
-    // .contentFingerprint) so identical content captured through different
-    // paths dedupes; older catalogs are migrated and merged on unlock.
+    // Version 2 made fingerprints content-based. Version 3 adds Pace usage
+    // metadata; its decoder defaults missing fields so no rewrite migration is
+    // required for existing catalogs or encrypted entries.
     private struct Catalog: Codable {
-        var version = 2
+        var version = 3
         var records: [ClipboardRecord]
     }
 
@@ -139,6 +139,17 @@ public actor HistoryStore {
         try saveCatalog()
     }
 
+    @discardableResult
+    public func recordUse(id: UUID, at date: Date = Date()) throws -> ClipboardRecord {
+        var item = try self.item(id: id)
+        item.lastUsedAt = date
+        item.useCount += 1
+        try write(item)
+        replaceRecord(for: item)
+        try saveCatalog()
+        return ClipboardRecord(item: item)
+    }
+
     public func delete(id: UUID) throws {
         _ = try requireKey()
         guard records.contains(where: { $0.id == id }) else {
@@ -199,6 +210,14 @@ public actor HistoryStore {
         for item in items.sorted(by: { $0.lastCopiedAt > $1.lastCopiedAt }) {
             if var survivor = survivors[item.fingerprint] {
                 survivor.copyCount += item.copyCount
+                survivor.useCount += item.useCount
+                if let usedAt = item.lastUsedAt {
+                    if let survivorUsedAt = survivor.lastUsedAt {
+                        survivor.lastUsedAt = max(survivorUsedAt, usedAt)
+                    } else {
+                        survivor.lastUsedAt = usedAt
+                    }
+                }
                 survivor.isPinned = survivor.isPinned || item.isPinned
                 survivor.createdAt = min(survivor.createdAt, item.createdAt)
                 survivors[item.fingerprint] = survivor

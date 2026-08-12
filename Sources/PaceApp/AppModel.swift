@@ -275,6 +275,8 @@ final class AppModel: ObservableObject {
             let item = try await store.item(id: record.id)
             try item.restore(mode: mode)
             monitor.acknowledgeCurrentClipboard()
+            _ = try await store.recordUse(id: record.id)
+            await refresh(updateStorageSummary: false)
             statusMessage = "Copied"
         } catch {
             statusMessage = error.localizedDescription
@@ -294,6 +296,8 @@ final class AppModel: ObservableObject {
                 into: target,
                 imageContent: mode == .original && record.kind == .image
             )
+            _ = try await store.recordUse(id: record.id)
+            await refresh(updateStorageSummary: false)
         } catch {
             statusMessage = error.localizedDescription
         }
@@ -659,6 +663,8 @@ final class AppModel: ObservableObject {
                         imageContent: mode == .original && item.kind == .image
                     )
                 }
+                _ = try await store.recordUse(id: id)
+                await refresh(updateStorageSummary: false)
                 return IPCResponse(id: request.id, success: true, message: request.command == .paste ? "Pasted." : "Copied.")
 
             case .delete:
