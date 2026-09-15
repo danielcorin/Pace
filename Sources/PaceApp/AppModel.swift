@@ -484,6 +484,20 @@ final class AppModel: ObservableObject {
         return loaded
     }
 
+    func itemImageContent(for record: ClipboardRecord) async -> ImagePreviewContent? {
+        guard record.kind == .image, vaultState == .unlocked,
+              let item = try? await store.item(id: record.id) else { return nil }
+        for type in ["public.png", "public.jpeg", "public.tiff"] {
+            if let representation = item.representations.first(where: { $0.typeIdentifier == type }) {
+                return ImagePreviewContent(
+                    data: representation.data,
+                    typeIdentifier: representation.typeIdentifier
+                )
+            }
+        }
+        return nil
+    }
+
     func itemDetailText(for record: ClipboardRecord) async -> String {
         let key = record.id.uuidString as NSString
         if let cached = itemTextCache.object(forKey: key) { return cached as String }

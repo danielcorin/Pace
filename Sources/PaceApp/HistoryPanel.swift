@@ -1,10 +1,28 @@
 import AppKit
+import Combine
 import PaceCore
+import QuickLookUI
 import SwiftUI
 
 private final class PacePanel: NSPanel {
+    weak var quickLookController: ImageQuickLookController?
+
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+        quickLookController?.hasItem == true
+    }
+
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        guard let panel else { return }
+        quickLookController?.configure(panel)
+    }
+
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        guard let panel else { return }
+        quickLookController?.relinquish(panel)
+    }
 }
 
 extension Notification.Name {
@@ -81,14 +99,25 @@ private enum PanelMetrics {
 @MainActor
 final class HistoryPanelCoordinator {
     private let model: AppModel
+    private let quickLookController = ImageQuickLookController()
     private var panel: PacePanel?
     private var targetApplication: NSRunningApplication?
     private var wantsVisible = false
     private var keyObserver: NSObjectProtocol?
     private var escapeMonitor: Any?
+    private var cancellables = Set<AnyCancellable>()
 
     init(model: AppModel) {
         self.model = model
+        quickLookController.onDismiss = { [weak self] in
+            self?.restoreFocusAfterQuickLook()
+        }
+        model.$vaultState
+            .sink { [weak self] state in
+                guard state != .unlocked else { return }
+                self?.quickLookController.close()
+            }
+            .store(in: &cancellables)
     }
 
     var isVisible: Bool { panel?.isVisible == true }
@@ -130,6 +159,7 @@ final class HistoryPanelCoordinator {
 
     func hide() {
         wantsVisible = false
+        quickLookController.close()
         panel?.orderOut(nil)
         model.query = ""
         model.snippetQuery = ""
@@ -160,6 +190,7 @@ final class HistoryPanelCoordinator {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
+        panel.quickLookController = quickLookController
 
         keyObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification,
@@ -189,6 +220,10 @@ final class HistoryPanelCoordinator {
                 self.hide()
                 Task { await self.model.copy(record, mode: mode) }
             },
+            onQuickLook: { [weak self] record in
+                guard let self else { return }
+                self.quickLookController.toggle(record: record, model: self.model)
+            },
             onPasteSnippet: { [weak self] snippet in
                 guard let self else { return }
                 let target = self.targetApplication
@@ -217,9 +252,17 @@ final class HistoryPanelCoordinator {
 
     private func panelDidResignKey() {
         guard wantsVisible else { return }
+        // Quick Look is an auxiliary panel; keep the history visible behind it.
+        guard !quickLookController.isVisible else { return }
         // Don't dismiss while an unlock is still settling.
         guard model.vaultState != .unlocking else { return }
         hide()
+    }
+
+    private func restoreFocusAfterQuickLook() {
+        guard wantsVisible, let panel, panel.isVisible else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
     }
 
     private func unlockAndRestorePanel() {
@@ -284,6 +327,7 @@ struct HistoryView: View {
 
     var onPaste: (ClipboardRecord, ClipboardRestoreMode) -> Void
     var onCopy: (ClipboardRecord, ClipboardRestoreMode) -> Void
+    var onQuickLook: (ClipboardRecord) -> Void
     var onPasteSnippet: (Snippet) -> Void
     var onCopySnippet: (Snippet) -> Void
     var onUnlock: () -> Void
@@ -510,6 +554,7 @@ struct HistoryView: View {
                         DetailPane(
                             record: selectedRecord,
                             derivedSnippet: selectedRecord.flatMap(model.snippetDerived),
+                            onQuickLook: onQuickLook,
                             onSaveAsSnippet: { beginPromotion($0) },
                             onOpenSnippet: openSnippet
                         )
@@ -876,6 +921,10 @@ struct HistoryView: View {
             // window before firing; a simultaneous gesture selects instantly.
             .simultaneousGesture(TapGesture().onEnded { selection = record.id })
             .contextMenu {
+                if record.kind == .image {
+                    Button("Quick Look") { onQuickLook(record) }
+                    Divider()
+                }
                 Button(record.kind == .image ? "Paste Image" : "Paste") {
                     onPaste(record, .original)
                 }
@@ -956,6 +1005,12 @@ struct HistoryView: View {
                 }
             }
             if snippetEditorDraft != nil { return event }
+            if model.panelScope == .clipboard,
+               event.keyCode == 49, modifiers.isEmpty,  // Space
+               let record = selectedRecord, record.kind == .image {
+                onQuickLook(record)
+                return nil
+            }
             if model.panelScope == .snippets,
                event.keyCode == 45, modifiers == .command {  // ⌘N
                 beginNewSnippet()
@@ -1572,6 +1627,7 @@ private struct DetailPane: View {
     @EnvironmentObject private var model: AppModel
     let record: ClipboardRecord?
     let derivedSnippet: Snippet?
+    let onQuickLook: (ClipboardRecord) -> Void
     let onSaveAsSnippet: (ClipboardRecord) -> Void
     let onOpenSnippet: (Snippet) -> Void
     @State private var image: CachedItemImage?
@@ -1611,6 +1667,14 @@ private struct DetailPane: View {
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .contentShape(Rectangle())
+                .onTapGesture { onQuickLook(record) }
+                .contextMenu {
+                    Button("Quick Look") { onQuickLook(record) }
+                }
+                .help("Quick Look (Space)")
+                .accessibilityLabel("Quick Look image")
+                .accessibilityAddTraits(.isButton)
                 .padding(14)
         } else if let text {
             PlainTextPreview(text: text)
