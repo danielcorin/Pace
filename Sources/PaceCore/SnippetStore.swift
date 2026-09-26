@@ -47,6 +47,14 @@ public actor SnippetStore {
         return SnippetSearchEngine.search(snippets, query: query, limit: limit)
     }
 
+    /// Every snippet, ordered by name. Used for exports.
+    public func allSnippets() throws -> [Snippet] {
+        _ = try requireKey()
+        return snippets.sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
     public func snippet(id: UUID) throws -> Snippet {
         _ = try requireKey()
         guard let snippet = snippets.first(where: { $0.id == id }) else {

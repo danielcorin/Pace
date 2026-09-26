@@ -19,8 +19,8 @@ configFiles:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.4.0"
-    CURRENT_PROJECT_VERSION: "7"
+    MARKETING_VERSION: "1.5.0"
+    CURRENT_PROJECT_VERSION: "8"
     CODE_SIGN_STYLE: Automatic
     ENABLE_HARDENED_RUNTIME: "YES"      # required for notarization
     GENERATE_INFOPLIST_FILE: "YES"
@@ -31,12 +31,22 @@ settings:
     # which the sandbox denies on incremental builds.
     ENABLE_USER_SCRIPT_SANDBOXING: "NO"
 
+packages:
+  TOML:
+    url: https://github.com/mattt/swift-toml.git
+    exactVersion: 2.0.0
+
 targets:
   PaceCore:
     type: library.static
     platform: macOS
     sources:
       - Sources/PaceCore
+    dependencies:
+      - package: TOML
+        # Static-library targets do not link package products by default in
+        # XcodeGen; PaceCore imports TOML, so make this dependency explicit.
+        link: true
     settings:
       base:
         PRODUCT_NAME: PaceCore
@@ -47,6 +57,8 @@ targets:
     platform: macOS
     sources:
       - Sources/PaceApp
+      - path: THIRD_PARTY_NOTICES.md
+        buildPhase: resources
     dependencies:
       - target: PaceCore
       - target: PaceCLI

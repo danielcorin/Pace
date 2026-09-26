@@ -60,11 +60,16 @@ final class AppModel: ObservableObject {
     @Published private(set) var launchesAtLogin = SMAppService.mainApp.status == .enabled
     @Published private(set) var hasAccessibilityAccess = AXIsProcessTrusted()
     @Published private(set) var hasPromptedForAccessibility = false
+    @Published private(set) var configuration = PaceConfiguration.defaults
+    @Published private(set) var configurationError: String?
 
     private let store: HistoryStore
     private let snippetStore: SnippetStore
     private let keyStore = VaultKeyStore()
     private let detector = SensitiveContentDetector()
+    let configurationStore = PaceConfigurationStore()
+    private var configurationStamp: Date?
+    private var hasLoadedConfiguration = false
     private let ocrService = OCRService()
     private var monitor: ClipboardMonitor!
     private var expansionMonitor: SnippetExpansionMonitor!
@@ -102,6 +107,7 @@ final class AppModel: ObservableObject {
 
     func start() {
         refreshPermissions()
+        reloadConfigurationIfNeeded()
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers.append(
             center.addObserver(
@@ -226,6 +232,68 @@ final class AppModel: ObservableObject {
         captureResumeTask?.cancel()
         captureResumeTask = nil
         capturePausedUntil = nil
+    }
+
+    /// Re-reads config.toml when its modification date changes, so edits
+    /// from the CLI or a text editor apply to the next copy without a file
+    /// watcher. An invalid file keeps the last good configuration in effect.
+    func reloadConfigurationIfNeeded(force: Bool = false) {
+        let stamp = configurationStore.modificationDate()
+        guard force || !hasLoadedConfiguration || stamp != configurationStamp else { return }
+        hasLoadedConfiguration = true
+        configurationStamp = stamp
+        do {
+            configuration = try configurationStore.load()
+            configurationError = nil
+        } catch {
+            configurationError = error.localizedDescription
+        }
+    }
+
+    func setCaptureExcluded(_ excluded: Bool, bundleIdentifier: String) {
+        do {
+            try configurationStore.update { configuration in
+                configuration.excludedApps.removeAll {
+                    $0.compare(bundleIdentifier, options: .caseInsensitive) == .orderedSame
+                }
+                if excluded { configuration.excludedApps.append(bundleIdentifier) }
+            }
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+        reloadConfigurationIfNeeded(force: true)
+    }
+
+    func export(
+        to url: URL,
+        scope: PaceExportScope,
+        passphrase: String?,
+        overwrite: Bool
+    ) async throws -> PaceExportSummary {
+        if let passphrase, passphrase.count < PaceExportCodec.minimumPassphraseLength {
+            throw PaceError.invalidArgument(
+                "The export passphrase must be at least \(PaceExportCodec.minimumPassphraseLength) characters."
+            )
+        }
+        let items = scope.includesClipboard ? try await store.allItems() : nil
+        let snippets = scope.includesSnippets ? try await snippetStore.allSnippets() : nil
+        let archive = PaceExportArchive(clipboard: items, snippets: snippets)
+        // Encoding a large history and deriving the passphrase key are both
+        // CPU-bound; keep them off the main actor.
+        let byteCount = try await Task.detached(priority: .userInitiated) {
+            let plaintext = try PaceExportCodec.encode(archive)
+            let output = try passphrase.map { try PaceExportCodec.encrypt(plaintext, passphrase: $0) }
+                ?? plaintext
+            try PaceExportCodec.write(output, to: url, overwrite: overwrite)
+            return Int64(output.count)
+        }.value
+        return PaceExportSummary(
+            path: url.path,
+            clipboardItemCount: items?.count ?? 0,
+            snippetCount: snippets?.count ?? 0,
+            byteCount: byteCount,
+            isEncrypted: passphrase != nil
+        )
     }
 
     func refresh(updateStorageSummary: Bool = true) async {
@@ -831,14 +899,55 @@ final class AppModel: ObservableObject {
                     success: true,
                     message: "Pace \(scope.title.lowercased()) opened."
                 )
+
+            case .export:
+                guard let path = request.arguments["path"], path.hasPrefix("/") else {
+                    throw PaceError.invalidArgument("An absolute export path is required.")
+                }
+                guard let scope = PaceExportScope(rawValue: request.arguments["scope"] ?? "all") else {
+                    throw PaceError.invalidArgument("--only must be clipboard or snippets.")
+                }
+                var passphrase: String?
+                if request.arguments["encrypt"] == "true" {
+                    guard let input = request.input, let value = String(data: input, encoding: .utf8) else {
+                        throw PaceError.invalidArgument("An export passphrase is required to encrypt.")
+                    }
+                    passphrase = value
+                }
+                let summary = try await export(
+                    to: URL(fileURLWithPath: path),
+                    scope: scope,
+                    passphrase: passphrase,
+                    overwrite: request.arguments["overwrite"] == "true"
+                )
+                return IPCResponse(
+                    id: request.id,
+                    success: true,
+                    message: Self.exportMessage(summary),
+                    exportSummary: summary
+                )
             }
         } catch {
             return IPCResponse.failure(id: request.id, error: error)
         }
     }
 
+    static func exportMessage(_ summary: PaceExportSummary) -> String {
+        func count(_ value: Int, _ noun: String) -> String {
+            "\(value.formatted()) \(noun)\(value == 1 ? "" : "s")"
+        }
+        let size = ByteCountFormatter.string(fromByteCount: summary.byteCount, countStyle: .file)
+        let detail = summary.isEncrypted ? "\(size), encrypted" : size
+        return "Exported \(count(summary.clipboardItemCount, "clipboard item")) and "
+            + "\(count(summary.snippetCount, "snippet")) to \(summary.path) (\(detail))."
+    }
+
     private func capture(_ snapshot: PasteboardSnapshot) {
         guard vaultState == .unlocked, !capturePaused else { return }
+        reloadConfigurationIfNeeded()
+        if configuration.excludesCapture(fromBundleIdentifier: snapshot.source.bundleIdentifier) {
+            return
+        }
         if detector.isSensitive(typeIdentifiers: snapshot.typeIdentifiers, text: snapshot.plainText) {
             statusMessage = "Sensitive clipboard item not saved"
             return

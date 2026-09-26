@@ -71,6 +71,12 @@ public actor HistoryStore {
         return item
     }
 
+    /// Every retained item, decrypted, newest first. Used for exports.
+    public func allItems() throws -> [ClipboardItem] {
+        _ = try requireKey()
+        return try records.map { try item(id: $0.id) }
+    }
+
     /// Returns the newest retained entries that can be represented as text.
     /// Snippet clipboard offsets deliberately skip opaque images and files so
     /// every returned value can be inserted into a text template.

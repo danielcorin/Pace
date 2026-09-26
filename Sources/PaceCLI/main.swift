@@ -7,6 +7,7 @@ struct PaceCLI {
         do {
             let command = try Command(arguments: Array(CommandLine.arguments.dropFirst()))
             if command.printHelpIfRequested() { return }
+            if try command.runLocally() { return }
             let response = try sendLaunchingPaceIfNeeded(command.request)
             guard response.success else {
                 let message = response.message ?? "Pace command failed."
@@ -105,8 +106,8 @@ PaceCLI.main()
 
 private struct Command {
     private static let booleanOptions: Set<String> = [
-        "--clear-keyword", "--clear-tags", "--expand", "--include-pinned",
-        "--json", "--no-expand", "--ocr-text", "--pin", "--pinned", "--plain",
+        "--clear-keyword", "--clear-tags", "--encrypt", "--expand", "--force",
+        "--include-pinned", "--json", "--no-expand", "--ocr-text", "--pin", "--pinned", "--plain",
         "--protect-pinned", "--prune", "--snippets", "--unpin"
     ]
 
@@ -198,6 +199,7 @@ private struct Command {
                 )
             case "retention": return try retentionRequest()
             case "snippet", "snippets": return try snippetRequest()
+            case "export": return try exportRequest()
             default:
                 throw PaceError.invalidArgument("Unknown command '\(name)'. Run `pace help` for usage.")
             }
@@ -487,6 +489,157 @@ private struct Command {
         return nil
     }
 
+    /// Commands that never need the running app: config edits the TOML file
+    /// directly, and decrypting an export only needs the passphrase.
+    func runLocally() throws -> Bool {
+        switch (name, values.first) {
+        case ("config", _):
+            try runConfig()
+            return true
+        case ("export", "decrypt"):
+            try decryptExport()
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func exportRequest() throws -> IPCRequest {
+        guard values.isEmpty, let output = options["--output"] else {
+            throw PaceError.invalidArgument(
+                "Usage: pace export --output PATH [--encrypt] [--only clipboard|snippets] [--force]"
+            )
+        }
+        var arguments = ["path": Self.absolutePath(output)]
+        if let scope = options["--only"] { arguments["scope"] = scope }
+        if flags.contains("--force") { arguments["overwrite"] = "true" }
+        var input: Data?
+        if flags.contains("--encrypt") {
+            arguments["encrypt"] = "true"
+            input = Data(try Self.readExportPassphrase(confirm: true).utf8)
+        }
+        return IPCRequest(command: .export, arguments: arguments, input: input)
+    }
+
+    private func decryptExport() throws {
+        guard values.count == 2 else {
+            throw PaceError.invalidArgument("Usage: pace export decrypt <file> [--output PATH] [--force]")
+        }
+        let encrypted = try Data(contentsOf: URL(fileURLWithPath: Self.absolutePath(values[1])))
+        guard PaceExportCodec.isEncrypted(encrypted) else {
+            throw PaceError.invalidArgument("\(values[1]) is not an encrypted Pace export.")
+        }
+        let plaintext = try PaceExportCodec.decrypt(
+            encrypted,
+            passphrase: Self.readExportPassphrase(confirm: false)
+        )
+        if let output = options["--output"] {
+            let url = URL(fileURLWithPath: Self.absolutePath(output))
+            try PaceExportCodec.write(plaintext, to: url, overwrite: flags.contains("--force"))
+            FileHandle.standardError.write(Data("Decrypted export written to \(url.path).\n".utf8))
+        } else {
+            FileHandle.standardOutput.write(plaintext)
+            FileHandle.standardOutput.write(Data("\n".utf8))
+        }
+    }
+
+    private func runConfig() throws {
+        let store = PaceConfigurationStore()
+        let operation = values.first ?? "show"
+        switch operation {
+        case "path":
+            Swift.print(store.fileURL.path)
+        case "show":
+            let configuration = try store.load()
+            if flags.contains("--json") {
+                let payload: [String: Any] = [
+                    "path": store.fileURL.path,
+                    PaceConfigurationKey.excludedApps.rawValue: configuration.excludedApps
+                ]
+                FileHandle.standardOutput.write(try JSONSerialization.data(
+                    withJSONObject: payload,
+                    options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+                ))
+                FileHandle.standardOutput.write(Data("\n".utf8))
+                return
+            }
+            Swift.print("# \(store.fileURL.path)")
+            for key in PaceConfigurationKey.allCases {
+                Swift.print("# \(key.documentation)")
+                switch key {
+                case .excludedApps:
+                    let quoted = configuration.excludedApps.map { "\"\($0)\"" }
+                    Swift.print("\(key.rawValue) = [\(quoted.joined(separator: ", "))]")
+                }
+            }
+        case "exclude", "include":
+            let identifiers = try values.dropFirst().map(Self.bundleIdentifier(for:))
+            guard !identifiers.isEmpty else {
+                throw PaceError.invalidArgument("Usage: pace config \(operation) <bundle-id|path/to/App.app>…")
+            }
+            try store.update { configuration in
+                for identifier in identifiers {
+                    configuration.excludedApps.removeAll {
+                        $0.compare(identifier, options: .caseInsensitive) == .orderedSame
+                    }
+                    if operation == "exclude" { configuration.excludedApps.append(identifier) }
+                }
+            }
+            for identifier in identifiers {
+                Swift.print(operation == "exclude"
+                    ? "Pace will not record copies from \(identifier)."
+                    : "Pace records copies from \(identifier).")
+            }
+        default:
+            throw PaceError.invalidArgument("Usage: pace config show|path|exclude|include")
+        }
+    }
+
+    private static func bundleIdentifier(for argument: String) throws -> String {
+        guard argument.hasSuffix(".app") || argument.hasSuffix(".app/") else { return argument }
+        let url = URL(fileURLWithPath: absolutePath(argument))
+        guard let identifier = Bundle(url: url)?.bundleIdentifier else {
+            throw PaceError.invalidArgument("Could not read a bundle identifier from \(argument).")
+        }
+        return identifier
+    }
+
+    private static func absolutePath(_ path: String) -> String {
+        URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+    }
+
+    /// Scripts can supply PACE_EXPORT_PASSPHRASE; otherwise the passphrase is
+    /// read from the terminal without echo, never from argv where other
+    /// processes could see it.
+    private static func readExportPassphrase(confirm: Bool) throws -> String {
+        if let value = ProcessInfo.processInfo.environment["PACE_EXPORT_PASSPHRASE"], !value.isEmpty {
+            return value
+        }
+        guard let passphrase = promptSecret("Export passphrase: ") else {
+            throw PaceError.invalidArgument(
+                "A passphrase is required. Run in a terminal or set PACE_EXPORT_PASSPHRASE."
+            )
+        }
+        if confirm {
+            guard passphrase.count >= PaceExportCodec.minimumPassphraseLength else {
+                throw PaceError.invalidArgument(
+                    "The export passphrase must be at least \(PaceExportCodec.minimumPassphraseLength) characters."
+                )
+            }
+            guard promptSecret("Confirm passphrase: ") == passphrase else {
+                throw PaceError.invalidArgument("The passphrases don't match.")
+            }
+        }
+        return passphrase
+    }
+
+    private static func promptSecret(_ prompt: String) -> String? {
+        var buffer = [CChar](repeating: 0, count: 1024)
+        defer { _ = memset_s(&buffer, buffer.count, 0, buffer.count) }
+        guard readpassphrase(prompt, &buffer, buffer.count, RPP_REQUIRE_TTY) != nil else { return nil }
+        return String(cString: buffer)
+    }
+
     private func retentionRequest() throws -> IPCRequest {
         guard let operation = values.first else {
             throw PaceError.invalidArgument("Usage: pace retention show|set|preview|prune")
@@ -548,6 +701,10 @@ private struct Command {
       pace retention show|preview|prune
       pace retention set [--days N|unlimited] [--max-items N|unlimited]
                          [--max-storage 1GB|unlimited] [--prune]
+      pace export --output PATH [--encrypt] [--only clipboard|snippets] [--force]
+      pace export decrypt <file> [--output PATH] [--force]
+      pace config show|path [--json]
+      pace config exclude|include <bundle-id|path/to/App.app>…
 
       pace snippets show
       pace snippets list [--limit N] [--json]
@@ -570,5 +727,10 @@ private struct Command {
     Snippets can be addressed by full or unique-prefix UUID, exact keyword,
     or case-insensitive name. Template input may be positional, piped on stdin,
     or supplied with --template/--file.
+
+    Exports are JSON. Plain exports are unencrypted; --encrypt prompts for a
+    passphrase (or reads PACE_EXPORT_PASSPHRASE) and seals the file with
+    AES-256-GCM. `pace config` edits ~/.config/pace/config.toml, which the
+    app re-reads on the next copy.
     """
 }

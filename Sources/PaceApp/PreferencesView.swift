@@ -27,6 +27,8 @@ struct PreferencesView: View {
     @State private var shortcutMessage: String?
     @State private var panelShortcuts: [PanelAction: HotKeyShortcut] = [:]
     @State private var excludedSnippetApplications: [String] = []
+    @State private var exportFeedback: Feedback?
+    @State private var isExporting = false
 
     private struct Feedback: Equatable {
         var message: String
@@ -108,6 +110,54 @@ struct PreferencesView: View {
             .toggleStyle(.switch)
 
             Section {
+                ForEach(model.configuration.excludedApps, id: \.self) { bundleID in
+                    applicationRow(bundleID) { model.setCaptureExcluded(false, bundleIdentifier: bundleID) }
+                }
+                Button("Add Application…") {
+                    guard let bundleID = chooseApplication() else { return }
+                    model.setCaptureExcluded(true, bundleIdentifier: bundleID)
+                }
+                if let error = model.configurationError {
+                    feedbackRow(error, systemImage: "exclamationmark.triangle.fill", color: .orange)
+                }
+            } header: {
+                Text("Never Record Copies From")
+            } footer: {
+                footerText {
+                    Text("Stored in \(configurationPath). Password managers that mark copies as concealed are always skipped.")
+                }
+            }
+
+            Section {
+                LabeledContent {
+                    HStack(spacing: 8) {
+                        if isExporting {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Button("Export…") { exportData(encrypted: false) }
+                        Button("Export Encrypted…") { exportData(encrypted: true) }
+                    }
+                    .disabled(isExporting || model.vaultState != .unlocked)
+                } label: {
+                    Text("Export history and snippets")
+                    Text("Writes everything to a JSON file")
+                }
+
+                if let exportFeedback {
+                    feedbackRow(
+                        exportFeedback.message,
+                        systemImage: exportFeedback.isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill",
+                        color: exportFeedback.isError ? .orange : .green
+                    )
+                }
+            } footer: {
+                footerText {
+                    Text("A plain export isn't encrypted: anyone who can read the file can read your clipboard history.")
+                }
+            }
+
+            Section {
                 LabeledContent {
                     Button("Install") { installCLI() }
                 } label: {
@@ -132,6 +182,7 @@ struct PreferencesView: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { model.reloadConfigurationIfNeeded(force: true) }
     }
 
     // MARK: - Shortcuts
@@ -256,23 +307,7 @@ struct PreferencesView: View {
 
             Section {
                 ForEach(excludedSnippetApplications, id: \.self) { bundleID in
-                    HStack {
-                        Image(systemName: "app.dashed")
-                            .foregroundStyle(.secondary)
-                        Text(applicationName(for: bundleID))
-                        Spacer()
-                        Text(bundleID)
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
-                        Button {
-                            removeExcludedApplication(bundleID)
-                        } label: {
-                            Image(systemName: "minus.circle.fill")
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                    }
+                    applicationRow(bundleID) { removeExcludedApplication(bundleID) }
                 }
                 Button("Add Application…") { addExcludedApplication() }
             } header: {
@@ -404,6 +439,28 @@ struct PreferencesView: View {
                 .foregroundStyle(color)
         }
         .transition(.opacity)
+    }
+
+    private func applicationRow(_ bundleID: String, onRemove: @escaping () -> Void) -> some View {
+        HStack {
+            Image(systemName: "app.dashed")
+                .foregroundStyle(.secondary)
+            Text(applicationName(for: bundleID))
+            Spacer()
+            Text(bundleID)
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            Button(action: onRemove) {
+                Image(systemName: "minus.circle.fill")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private var configurationPath: String {
+        (model.configurationStore.fileURL.path as NSString).abbreviatingWithTildeInPath
     }
 
     private func footerText(@ViewBuilder content: () -> some View) -> some View {
@@ -587,7 +644,7 @@ struct PreferencesView: View {
         }
     }
 
-    private func addExcludedApplication() {
+    private func chooseApplication() -> String? {
         let panel = NSOpenPanel()
         panel.title = "Choose an Application"
         panel.prompt = "Exclude"
@@ -596,9 +653,44 @@ struct PreferencesView: View {
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
-        guard panel.runModal() == .OK,
-              let url = panel.url,
-              let bundleID = Bundle(url: url)?.bundleIdentifier,
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return Bundle(url: url)?.bundleIdentifier
+    }
+
+    private func exportData(encrypted: Bool) {
+        var passphrase: String?
+        if encrypted {
+            guard let value = ExportPrompts.passphrase() else { return }
+            passphrase = value
+        }
+        guard let url = ExportPrompts.destination(encrypted: encrypted) else { return }
+        withAnimation(Self.quickFade) {
+            isExporting = true
+            exportFeedback = nil
+        }
+        Task {
+            let feedback: Feedback
+            do {
+                // The save panel already confirmed replacing an existing file.
+                let summary = try await model.export(
+                    to: url,
+                    scope: .all,
+                    passphrase: passphrase,
+                    overwrite: true
+                )
+                feedback = Feedback(message: AppModel.exportMessage(summary), isError: false)
+            } catch {
+                feedback = Feedback(message: error.localizedDescription, isError: true)
+            }
+            withAnimation(Self.quickFade) {
+                exportFeedback = feedback
+                isExporting = false
+            }
+        }
+    }
+
+    private func addExcludedApplication() {
+        guard let bundleID = chooseApplication(),
               !excludedSnippetApplications.contains(bundleID) else { return }
         excludedSnippetApplications.append(bundleID)
         excludedSnippetApplications.sort()

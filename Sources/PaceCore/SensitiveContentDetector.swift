@@ -23,17 +23,51 @@ public struct SensitiveContentDetector: Sendable {
             return true
         }
 
-        let patterns = [
-            #"\b(?:sk|rk|pk)-(?:live|test|proj)-[A-Za-z0-9_-]{16,}\b"#,
-            #"\bgh[opusr]_[A-Za-z0-9]{30,}\b"#,
-            #"\bAKIA[0-9A-Z]{16}\b"#
-        ]
-        for pattern in patterns where trimmed.range(of: pattern, options: .regularExpression) != nil {
+        for regex in Self.secretPatterns
+        where regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)) != nil {
             return true
         }
 
         return containsLikelyPaymentCard(trimmed)
     }
+
+    // Token shapes are anchored on vendor prefixes so ordinary identifiers
+    // (branch names like "sk-learn-upgrade", UUIDs, hashes) are not flagged.
+    private static let secretPatterns: [NSRegularExpression] = [
+        // Anthropic, OpenRouter, and OpenAI project/service/admin keys.
+        #"\bsk-ant-[a-z0-9]+-[A-Za-z0-9_-]{20,}"#,
+        #"\bsk-or-v1-[A-Fa-f0-9]{32,}"#,
+        #"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}"#,
+        // Legacy OpenAI keys and most OpenAI-compatible providers: sk- plus
+        // one unbroken alphanumeric run (hyphenated words never match).
+        #"\bsk-[A-Za-z0-9]{32,}\b"#,
+        // Other model providers: Groq, Hugging Face, xAI.
+        #"\bgsk_[A-Za-z0-9]{40,}\b"#,
+        #"\bhf_[A-Za-z0-9]{30,}\b"#,
+        #"\bxai-[A-Za-z0-9]{40,}\b"#,
+        // Stripe secret and restricted keys (underscored), plus the hyphenated
+        // live/test/proj shape Pace has always rejected.
+        #"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"#,
+        #"\b(?:sk|rk|pk)-(?:live|test|proj)-[A-Za-z0-9_-]{16,}\b"#,
+        // GitHub classic and fine-grained tokens, GitLab, npm.
+        #"\bgh[opusr]_[A-Za-z0-9]{30,}\b"#,
+        #"\bgithub_pat_[A-Za-z0-9_]{22,}\b"#,
+        #"\bglpat-[A-Za-z0-9_-]{20,}\b"#,
+        #"\bnpm_[A-Za-z0-9]{36}\b"#,
+        // AWS long-term and session access key IDs, Google API keys.
+        #"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"#,
+        #"\bAIza[0-9A-Za-z_-]{35}\b"#,
+        // Slack tokens and incoming webhooks.
+        #"\bxox[abposr]-[A-Za-z0-9-]{10,}"#,
+        #"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+"#,
+        // JSON Web Tokens (header.payload.signature, both JSON parts base64url).
+        #"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"#,
+        // .env / YAML assignments to secret-named keys. The value must be a
+        // bare token of 12+ characters with both letters and digits, so code
+        // (os.environ["API_KEY"]), templating (${{ secrets.X }}), and
+        // placeholders ("changeme", "your-api-key") are left alone.
+        #"(?m)^[ \t]*(?:export[ \t]+)?(?i:[a-z0-9_]*(?:secret|token|password|passwd|api_?key|access_?key|private_?key|auth_?key)[a-z0-9_]*)[ \t]*[=:][ \t]*["']?(?=[A-Za-z0-9_\-+/=.]*[0-9])(?=[A-Za-z0-9_\-+/=.]*[A-Za-z])[A-Za-z0-9_\-+/=.]{12,}["']?[ \t]*$"#
+    ].map { try! NSRegularExpression(pattern: $0) }
 
     // A bare "13–19 digits" heuristic flags ordinary numeric IDs — crash
     // reports and logs are full of them (mach absolute times, thread state).

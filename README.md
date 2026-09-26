@@ -22,7 +22,9 @@ searchable and pasteable, and everything is encrypted at rest. A companion
 - Automatic local OCR through Vision; recognized text participates in search
 - Explicit OCR-text paste and copy actions for images; recognized terminals receive original image pastes through `Ctrl+V` for tools that support clipboard images, such as Claude Code
 - AES-GCM encrypted item files and search catalog; the vault key lives in the login keychain
-- Sensitive pasteboard markers and recognizable credential formats are never stored
+- Sensitive pasteboard markers and recognizable credentials (API keys for Anthropic, OpenAI, OpenRouter, and other model providers; GitHub, GitLab, Slack, Stripe, AWS, and Google tokens; JWTs; `.env`-style secrets; payment cards) are never stored
+- Per-app capture exclusions in a plain-text `~/.config/pace/config.toml`
+- Export history and snippets to JSON, optionally encrypted with a passphrase
 - Configurable retention limits by age, item count, and storage size
 - Pause capture for a fixed interval or until resumed
 - Same-user CLI access over a private Unix socket; no token system
@@ -116,6 +118,14 @@ pace snippets promote CLIPBOARD_ITEM_ID --name 'Email' --keyword ';em' --expand
 pace retention show
 pace retention preview
 pace retention set --days 30 --max-items 10000 --max-storage 1GB --prune
+
+pace export --output ~/Backups/pace.json
+pace export --output ~/Backups/pace-encrypted.json --encrypt
+pace export decrypt ~/Backups/pace-encrypted.json --output pace.json
+
+pace config show
+pace config exclude com.apple.Terminal /Applications/Ghostty.app
+pace config include com.apple.Terminal
 ```
 
 The CLI launches the menu-bar service when needed, and the vault unlocks
@@ -127,6 +137,34 @@ name. Snippet templates may be positional, piped on stdin, or read with
 the same live clipboard and snippet catalog as the app. `pace add` accepts text,
 piped input, or a file, plus `--timestamp`, `--source-kind`, and `--session`
 metadata so imports and agent workflows can preserve context.
+
+### Configuration
+
+`~/.config/pace/config.toml` (or `$XDG_CONFIG_HOME/pace/config.toml`) holds
+settings meant for dotfiles and scripts. Edit it by hand, with `pace config`,
+or from Settings; Pace re-reads it on the next copy.
+
+```toml
+# Bundle identifiers whose copies Pace never records.
+excluded-apps = ["com.apple.Terminal", "com.mitchellh.ghostty"]
+```
+
+Unknown keys are rejected so typos don't pass silently. If the file becomes
+invalid, Pace keeps using the last valid configuration and reports the error
+in Settings.
+
+### Exporting
+
+`pace export` (or **Settings → General → Export…**) writes clipboard history
+and snippets to one JSON file with mode 0600. Each clipboard entry carries a
+`text` field with its plain or OCR text alongside the full item, whose binary
+representations are base64. `--only clipboard|snippets` narrows the export and
+`--force` replaces an existing file.
+
+A plain export is not encrypted. `--encrypt` prompts for a passphrase (or reads
+`PACE_EXPORT_PASSPHRASE`) and seals the JSON with AES-256-GCM using a
+PBKDF2-HMAC-SHA256 key (600,000 iterations). The envelope is JSON that records
+its parameters, and `pace export decrypt` restores the plain export.
 
 ### Importing from Alfred
 
@@ -242,7 +280,8 @@ Everything stays on your Mac. History items and the search catalog are
 encrypted with AES-GCM; the key is held in your login keychain, dropped from
 memory while the Mac sleeps or the session locks, and reloaded automatically.
 Pasteboard types that mark transient or secret content, and text matching
-recognizable credential formats, are never stored. Debug builds keep a separate
+recognizable credential formats, are never stored, and apps listed in
+`excluded-apps` are skipped entirely. Debug builds keep a separate
 key and database under Pace's `Debug` support directory.
 
 Pace is not sandboxed because it reads the general pasteboard and synthesizes

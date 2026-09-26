@@ -6,7 +6,7 @@ only the YAML is committed. `*.xcodeproj` is git-ignored and regenerated on dema
 
 ## Layout
 - `project.yml` — XcodeGen spec (source of truth for the Xcode project).
-- `Sources/PaceCore/` — encrypted store, search, retention, IPC, and shared models.
+- `Sources/PaceCore/` — encrypted store, search, retention, IPC, TOML config, export, and shared models.
 - `Sources/PaceApp/` — menu-bar UI, hotkey panel, capture, OCR, and paste behavior.
 - `Sources/PaceCLI/` — the companion `pace` command-line executable.
 - `Tests/PaceCoreTests/` — core store, search, sensitive-content, retention, and IPC tests.
