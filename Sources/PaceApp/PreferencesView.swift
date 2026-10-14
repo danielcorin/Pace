@@ -61,6 +61,9 @@ struct PreferencesView: View {
 
             retentionTab
                 .tabItem { Label("Retention", systemImage: "clock.arrow.circlepath") }
+
+            UsageStatsView()
+                .tabItem { Label("Stats", systemImage: "chart.bar") }
         }
         .frame(width: 560, height: 460)
         .onAppear(perform: load)

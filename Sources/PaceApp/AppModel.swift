@@ -62,9 +62,12 @@ final class AppModel: ObservableObject {
     @Published private(set) var hasPromptedForAccessibility = false
     @Published private(set) var configuration = PaceConfiguration.defaults
     @Published private(set) var configurationError: String?
+    /// Bumped whenever a usage event is recorded so open stats views reload.
+    @Published private(set) var usageRevision = 0
 
     private let store: HistoryStore
     private let snippetStore: SnippetStore
+    private let usageStore: UsageStatsStore
     private let keyStore = VaultKeyStore()
     private let detector = SensitiveContentDetector()
     let configurationStore = PaceConfigurationStore()
@@ -95,6 +98,7 @@ final class AppModel: ObservableObject {
     init(rootURL: URL = PacePaths.applicationSupportDirectory) {
         store = HistoryStore(rootURL: rootURL)
         snippetStore = SnippetStore(rootURL: rootURL)
+        usageStore = UsageStatsStore(rootURL: rootURL)
         monitor = ClipboardMonitor { [weak self] snapshot in
             self?.capture(snapshot)
         }
@@ -173,9 +177,11 @@ final class AppModel: ObservableObject {
             }
             try await store.unlock(with: key)
             try await snippetStore.unlock(with: key)
+            try await usageStore.unlock(with: key)
             guard generation == securityGeneration else {
                 await store.lock()
                 await snippetStore.lock()
+                await usageStore.lock()
                 vaultState = .locked
                 return
             }
@@ -191,6 +197,7 @@ final class AppModel: ObservableObject {
         } catch {
             await store.lock()
             await snippetStore.lock()
+            await usageStore.lock()
             vaultState = .failed(error.localizedDescription)
             statusMessage = error.localizedDescription
         }
@@ -202,6 +209,7 @@ final class AppModel: ObservableObject {
         expansionMonitor.stop()
         await store.lock()
         await snippetStore.lock()
+        await usageStore.lock()
         records = []
         snippets = []
         snippetCatalog = []
@@ -365,6 +373,7 @@ final class AppModel: ObservableObject {
                 imageContent: mode == .original && record.kind == .image
             )
             _ = try await store.recordUse(id: record.id)
+            await recordUsage(.clipboardPaste)
             await refresh(updateStorageSummary: false)
         } catch {
             statusMessage = error.localizedDescription
@@ -515,6 +524,17 @@ final class AppModel: ObservableObject {
         await refresh()
         await refreshSnippets()
         return rendered
+    }
+
+    func usageReport(for period: UsagePeriod) async throws -> UsageReport {
+        try await usageStore.report(period: period)
+    }
+
+    /// Stats are best-effort: a failed counter write must never fail the
+    /// paste or expansion that triggered it.
+    private func recordUsage(_ event: UsageEvent) async {
+        guard (try? await usageStore.record(event)) != nil else { return }
+        usageRevision += 1
     }
 
     func updateRetention(_ policy: RetentionPolicy, pruneImmediately: Bool) async -> RetentionReport? {
@@ -744,6 +764,7 @@ final class AppModel: ObservableObject {
                         into: target,
                         imageContent: mode == .original && item.kind == .image
                     )
+                    await recordUsage(.clipboardPaste)
                 }
                 _ = try await store.recordUse(id: id)
                 await refresh(updateStorageSummary: false)
@@ -900,6 +921,17 @@ final class AppModel: ObservableObject {
                     message: "Pace \(scope.title.lowercased()) opened."
                 )
 
+            case .stats:
+                let rawPeriod = request.arguments["period"] ?? UsagePeriod.last30Days.rawValue
+                guard let period = UsagePeriod(rawValue: rawPeriod) else {
+                    throw PaceError.invalidArgument("--period must be 7d, 30d, 90d, or 12m.")
+                }
+                return IPCResponse(
+                    id: request.id,
+                    success: true,
+                    usageReport: try await usageReport(for: period)
+                )
+
             case .export:
                 guard let path = request.arguments["path"], path.hasPrefix("/") else {
                     throw PaceError.invalidArgument("An absolute export path is required.")
@@ -1027,6 +1059,7 @@ final class AppModel: ObservableObject {
                     restoresClipboard: SnippetExpansionPreferences.restoresClipboard
                 )
                 _ = try await self.snippetStore.recordUse(id: match.snippet.id)
+                await self.recordUsage(.snippetExpansion)
                 await self.refreshSnippets()
             } catch {
                 self.statusMessage = error.localizedDescription

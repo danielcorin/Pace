@@ -200,6 +200,12 @@ private struct Command {
             case "retention": return try retentionRequest()
             case "snippet", "snippets": return try snippetRequest()
             case "export": return try exportRequest()
+            case "stats":
+                let period = options["--period"] ?? UsagePeriod.last30Days.rawValue
+                guard values.isEmpty, UsagePeriod(rawValue: period) != nil else {
+                    throw PaceError.invalidArgument("Usage: pace stats [--period 7d|30d|90d|12m] [--json]")
+                }
+                return IPCRequest(command: .stats, arguments: ["period": period])
             default:
                 throw PaceError.invalidArgument("Unknown command '\(name)'. Run `pace help` for usage.")
             }
@@ -240,6 +246,11 @@ private struct Command {
             if let enabled = status.isSnippetExpansionEnabled {
                 Swift.print("Expansion: \(enabled ? "enabled" : "disabled")")
             }
+            return
+        }
+
+        if let report = response.usageReport {
+            printUsage(report)
             return
         }
 
@@ -323,6 +334,76 @@ private struct Command {
             Swift.print("Cleanup: \(report.itemCount) items, \(ByteCountFormatter.string(fromByteCount: report.byteCount, countStyle: .file))")
         }
         if let message = response.message { Swift.print(message) }
+    }
+
+    private func printUsage(_ report: UsageReport) {
+        let pastes = report.buckets.map(\.clipboardPastes)
+        let expansions = report.buckets.map(\.snippetExpansions)
+        let countWidth = max(6, String(max(pastes.max() ?? 0, expansions.max() ?? 0)).count)
+        let barWidth = 20
+        func pad(_ text: String, _ width: Int, leading: Bool = false) -> String {
+            let padding = String(repeating: " ", count: max(0, width - text.count))
+            return leading ? padding + text : text + padding
+        }
+
+        Swift.print("Pace usage · \(report.period.title.lowercased())")
+        Swift.print("")
+        let totals = [
+            ("Clipboard pastes", report.total.clipboardPastes.formatted(), report.allTime.clipboardPastes.formatted()),
+            ("Snippet expansions", report.total.snippetExpansions.formatted(), report.allTime.snippetExpansions.formatted())
+        ]
+        let totalWidth = totals.map(\.1.count).max() ?? 0
+        let allTimeWidth = totals.map(\.2.count).max() ?? 0
+        for (title, total, allTime) in totals {
+            Swift.print(
+                pad(title, 18) + "  " + pad(total, totalWidth, leading: true)
+                    + "   " + pad(allTime, allTimeWidth, leading: true) + " all time"
+            )
+        }
+        Swift.print("")
+
+        let labels = report.buckets.map { Self.usageLabel($0.date, granularity: report.granularity) }
+        let labelWidth = labels.map(\.count).max() ?? 0
+        Swift.print(
+            pad("", labelWidth) + "  " + pad("Pastes", countWidth + 1 + barWidth)
+                + "  " + "Expansions"
+        )
+        for (index, label) in labels.enumerated() {
+            let row = pad(label, labelWidth)
+                + "  " + pad(String(pastes[index]), countWidth, leading: true)
+                + " " + pad(Self.bar(pastes[index], max: pastes.max() ?? 0, width: barWidth), barWidth)
+                + "  " + pad(String(expansions[index]), countWidth, leading: true)
+                + " " + Self.bar(expansions[index], max: expansions.max() ?? 0, width: barWidth)
+            Swift.print(row.trimmingCharacters(in: .whitespaces))
+        }
+        Swift.print("")
+        if let since = report.trackingSince {
+            Swift.print("Tracking since \(since). Each column is scaled to its own maximum.")
+        } else {
+            Swift.print("Nothing recorded yet. Pastes from Pace and keyword expansions are counted from now on.")
+        }
+    }
+
+    /// A horizontal bar drawn with eighth-block characters, scaled so the
+    /// period's largest value fills `width` cells. Non-zero values always
+    /// show at least a sliver.
+    private static func bar(_ value: Int, max maximum: Int, width: Int) -> String {
+        guard value > 0, maximum > 0 else { return "" }
+        let eighths = Swift.max(1, Int((Double(value) / Double(maximum) * Double(width * 8)).rounded()))
+        let partials = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
+        return String(repeating: "█", count: eighths / 8) + partials[eighths % 8]
+    }
+
+    private static func usageLabel(_ day: String, granularity: UsageGranularity) -> String {
+        guard let date = UsageDayKey.date(from: day) else { return day }
+        let formatter = DateFormatter()
+        switch granularity {
+        case .day: formatter.setLocalizedDateFormatFromTemplate("EEE MMM d")
+        case .week: formatter.setLocalizedDateFormatFromTemplate("MMM d")
+        case .month: formatter.setLocalizedDateFormatFromTemplate("MMM yyyy")
+        }
+        let label = formatter.string(from: date)
+        return granularity == .week ? "Week of \(label)" : label
     }
 
     private func requiredID() throws -> String {
@@ -703,6 +784,7 @@ private struct Command {
                          [--max-storage 1GB|unlimited] [--prune]
       pace export --output PATH [--encrypt] [--only clipboard|snippets] [--force]
       pace export decrypt <file> [--output PATH] [--force]
+      pace stats [--period 7d|30d|90d|12m] [--json]
       pace config show|path [--json]
       pace config exclude|include <bundle-id|path/to/App.app>…
 
@@ -732,5 +814,8 @@ private struct Command {
     passphrase (or reads PACE_EXPORT_PASSPHRASE) and seals the file with
     AES-256-GCM. `pace config` edits ~/.config/pace/config.toml, which the
     app re-reads on the next copy.
+
+    `pace stats` charts clipboard pastes and snippet keyword expansions per
+    day (7d, 30d), week (90d), or month (12m). Defaults to 30d.
     """
 }

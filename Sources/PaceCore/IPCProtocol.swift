@@ -29,6 +29,7 @@ public enum IPCCommand: String, Codable, Sendable {
     case snippetPromote
     case show
     case export
+    case stats
 }
 
 public struct IPCRequest: Codable, Sendable {
@@ -92,6 +93,7 @@ public struct IPCResponse: Codable, Sendable {
     public var retentionPolicy: RetentionPolicy?
     public var retentionReport: RetentionReport?
     public var exportSummary: PaceExportSummary?
+    public var usageReport: UsageReport?
 
     public init(
         id: UUID,
@@ -106,7 +108,8 @@ public struct IPCResponse: Codable, Sendable {
         status: PaceStatus? = nil,
         retentionPolicy: RetentionPolicy? = nil,
         retentionReport: RetentionReport? = nil,
-        exportSummary: PaceExportSummary? = nil
+        exportSummary: PaceExportSummary? = nil,
+        usageReport: UsageReport? = nil
     ) {
         self.id = id
         self.success = success
@@ -121,6 +124,7 @@ public struct IPCResponse: Codable, Sendable {
         self.retentionPolicy = retentionPolicy
         self.retentionReport = retentionReport
         self.exportSummary = exportSummary
+        self.usageReport = usageReport
     }
 
     public static func failure(id: UUID, error: Error) -> IPCResponse {
