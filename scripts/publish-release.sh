@@ -688,13 +688,14 @@ if [[ "$BUILD_FROM_SOURCE" -eq 1 ]]; then
         -destination 'generic/platform=macOS' \
         -archivePath "$ARCHIVE_PATH" \
         CODE_SIGNING_ALLOWED=NO \
-        archive
+        ENABLE_CODE_COVERAGE=NO CLANG_COVERAGE_MAPPING=NO archive
 
     APP_PATH="$ARCHIVE_PATH/Products/Applications/$PRODUCT_NAME.app"
     [[ -d "$APP_PATH" ]] || fail "archive contains no app at $APP_PATH"
     sign_and_notarize_app
 fi
 
+"$(dirname "$0")/verify-no-coverage.sh" "$APP_PATH"
 verify_app
 
 mkdir -p "$OUT_DIR"
