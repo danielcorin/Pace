@@ -186,7 +186,10 @@ final class ImageQuickLookController: NSObject, @preconcurrency QLPreviewPanelDa
         ) { [weak self, weak panel] _ in
             guard let panel else { return }
             Task { @MainActor in
-                self?.scheduleReveal(
+                // A resize queued just before the reveal began would cancel
+                // and restart its fade; the reveal removes the observer first.
+                guard let self, self.resizeObserver != nil else { return }
+                self.scheduleReveal(
                     of: panel,
                     recordID: recordID,
                     afterNanoseconds: 60_000_000
@@ -205,16 +208,31 @@ final class ImageQuickLookController: NSObject, @preconcurrency QLPreviewPanelDa
             try? await Task.sleep(nanoseconds: delay)
             guard !Task.isCancelled, let self, let panel,
                   self.item?.recordID == recordID, panel.isVisible else { return }
-            self.stopWaitingToReveal()
-            // Set directly rather than animating: the first visible frame is
-            // the completed native Quick Look panel at its settled size.
-            panel.alphaValue = 1
+            // Only the observer goes; cancelling revealTask here would cancel
+            // this fade.
+            self.stopObservingResize()
+            // The fade starts from the completed native Quick Look panel at
+            // its settled size. It steps inside revealTask rather than using
+            // the window animator so a replacement preview or a dismissal
+            // (both cancel revealTask) stops it cleanly.
+            let steps = 7
+            for step in 1...steps {
+                let progress = CGFloat(step) / CGFloat(steps)
+                panel.alphaValue = 1 - (1 - progress) * (1 - progress)
+                guard step < steps else { break }
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                guard !Task.isCancelled, self.item?.recordID == recordID else { return }
+            }
         }
     }
 
     private func stopWaitingToReveal() {
         revealTask?.cancel()
         revealTask = nil
+        stopObservingResize()
+    }
+
+    private func stopObservingResize() {
         if let resizeObserver {
             NotificationCenter.default.removeObserver(resizeObserver)
             self.resizeObserver = nil

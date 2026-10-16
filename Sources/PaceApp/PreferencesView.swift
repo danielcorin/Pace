@@ -23,6 +23,8 @@ struct PreferencesView: View {
 
     @State private var cleanupOutcome: CleanupOutcome?
     @State private var isCleaningUp = false
+    @State private var pendingCleanup: PendingCleanup?
+    @State private var confirmsCleanup = false
     @State private var cliFeedback: Feedback?
     @State private var shortcutMessage: String?
     @State private var panelShortcuts: [PanelAction: HotKeyShortcut] = [:]
@@ -38,6 +40,15 @@ struct PreferencesView: View {
     private enum CleanupOutcome: Equatable {
         case preview(RetentionReport)
         case applied(RetentionReport)
+        case previewFailed
+        case applyFailed
+    }
+
+    /// The policy awaiting confirmation, and what applying it would delete
+    /// when a preview could be computed.
+    private struct PendingCleanup {
+        var policy: RetentionPolicy
+        var report: RetentionReport?
     }
 
     private static let quickFade = Animation.easeOut(duration: 0.15)
@@ -82,10 +93,16 @@ struct PreferencesView: View {
     private var generalTab: some View {
         Form {
             Section {
+                accessibilityRow
+            }
+
+            Section {
                 Toggle(isOn: $model.capturePaused) {
                     Text("Pause clipboard capture")
                     if let until = model.capturePausedUntil {
                         Text("Paused until \(until.formatted(date: .omitted, time: .shortened))")
+                    } else if model.capturePaused {
+                        Text("Paused until you resume it")
                     } else {
                         Text("New copies aren't saved while paused")
                     }
@@ -121,7 +138,11 @@ struct PreferencesView: View {
                     model.setCaptureExcluded(true, bundleIdentifier: bundleID)
                 }
                 if let error = model.configurationError {
-                    feedbackRow(error, systemImage: "exclamationmark.triangle.fill", color: .orange)
+                    feedbackRow(
+                        "Pace couldn't read config.toml and is using the last valid settings. \(error)",
+                        systemImage: "exclamationmark.triangle.fill",
+                        color: .orange
+                    )
                 }
             } header: {
                 Text("Never Record Copies From")
@@ -185,7 +206,41 @@ struct PreferencesView: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear { model.reloadConfigurationIfNeeded(force: true) }
+        .onAppear {
+            model.reloadConfigurationIfNeeded(force: true)
+            model.refreshPermissions()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            model.refreshPermissions()
+        }
+    }
+
+    @ViewBuilder
+    private var accessibilityRow: some View {
+        if model.hasAccessibilityAccess {
+            Label {
+                Text("Accessibility access granted")
+            } icon: {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            }
+        } else {
+            HStack {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Accessibility access needed")
+                        Text("Pace needs it to paste into other apps")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.yellow)
+                }
+                Spacer()
+                Button("Grant Access…") { model.requestAccessibilityAccess() }
+            }
+        }
     }
 
     // MARK: - Shortcuts
@@ -257,6 +312,17 @@ struct PreferencesView: View {
     private var snippetsTab: some View {
         Form {
             Section {
+                LabeledContent {
+                    Button("Open Snippets") {
+                        AppRuntime.shared.showPanel(scope: .snippets)
+                    }
+                } label: {
+                    Text("Snippet library")
+                    Text("Create, edit, and organize your snippets")
+                }
+            }
+
+            Section {
                 Toggle(isOn: $snippetExpansionEnabled) {
                     Text("Expand snippets while typing")
                     Text("Replace configured keywords in other applications")
@@ -298,14 +364,7 @@ struct PreferencesView: View {
                     Text("Extra Slow").tag(0.18)
                 }
             } header: {
-                HStack {
-                    Text("Expansion")
-                    Spacer()
-                    Button("Open Snippets") {
-                        AppRuntime.shared.showPanel(scope: .snippets)
-                    }
-                    .font(.caption)
-                }
+                Text("Expansion")
             }
 
             Section {
@@ -346,9 +405,9 @@ struct PreferencesView: View {
                 .toggleStyle(.switch)
 
                 HStack(spacing: 10) {
-                    Button("Preview Cleanup") { runCleanup(prune: false) }
+                    Button("Preview Cleanup") { previewCleanup() }
                         .disabled(isCleaningUp || draftPolicy == nil)
-                    Button("Apply and Clean Up") { runCleanup(prune: true) }
+                    Button("Apply and Clean Up") { confirmCleanup() }
                         .buttonStyle(.borderedProminent)
                         .disabled(isCleaningUp || draftPolicy == nil)
                     if isCleaningUp {
@@ -370,6 +429,31 @@ struct PreferencesView: View {
             guard cleanupOutcome != nil else { return }
             withAnimation(Self.quickFade) { cleanupOutcome = nil }
         }
+        .confirmationDialog(
+            "Apply these limits and clean up?",
+            isPresented: $confirmsCleanup,
+            titleVisibility: .visible,
+            presenting: pendingCleanup
+        ) { pending in
+            Button(cleanupButtonTitle(pending.report), role: .destructive) {
+                applyCleanup(pending.policy)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { pending in
+            Text(cleanupConfirmationMessage(pending.report))
+        }
+    }
+
+    private func cleanupButtonTitle(_ report: RetentionReport?) -> String {
+        guard let report else { return "Apply and Clean Up" }
+        return "Delete \(itemsPhrase(report.itemCount))"
+    }
+
+    private func cleanupConfirmationMessage(_ report: RetentionReport?) -> String {
+        guard let report else {
+            return "Items over these limits are permanently deleted from your history. This can't be undone."
+        }
+        return "This permanently deletes \(itemsPhrase(report.itemCount)) (\(byteString(report.byteCount))) from your history. This can't be undone."
     }
 
     private func limitRow(
@@ -405,7 +489,7 @@ struct PreferencesView: View {
         switch outcome {
         case .preview(let report) where report.itemCount == 0:
             feedbackRow(
-                "Nothing to clean up — everything is within these limits.",
+                "Nothing to clean up. Everything is within these limits.",
                 systemImage: "checkmark.circle.fill",
                 color: .green
             )
@@ -426,6 +510,18 @@ struct PreferencesView: View {
                 "Settings applied. Removed \(itemsPhrase(report.itemCount)) (\(byteString(report.byteCount))).",
                 systemImage: "checkmark.circle.fill",
                 color: .green
+            )
+        case .previewFailed:
+            feedbackRow(
+                "Couldn't preview cleanup. Make sure Pace is unlocked, then try again.",
+                systemImage: "exclamationmark.triangle.fill",
+                color: .orange
+            )
+        case .applyFailed:
+            feedbackRow(
+                "Couldn't apply these limits. Make sure Pace is unlocked, then try again.",
+                systemImage: "exclamationmark.triangle.fill",
+                color: .orange
             )
         }
     }
@@ -459,6 +555,8 @@ struct PreferencesView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
+            .help("Remove \(applicationName(for: bundleID))")
+            .accessibilityLabel("Remove \(applicationName(for: bundleID))")
         }
     }
 
@@ -517,21 +615,44 @@ struct PreferencesView: View {
         return policy
     }
 
-    private func runCleanup(prune: Bool) {
+    /// Previews without saving: the draft limits only take effect through
+    /// Apply and Clean Up.
+    private func previewCleanup() {
         guard let policy = draftPolicy, !isCleaningUp else { return }
         isCleaningUp = true
         Task {
-            let report: RetentionReport?
-            if prune {
-                report = await model.updateRetention(policy, pruneImmediately: true)
-            } else {
-                _ = await model.updateRetention(policy, pruneImmediately: false)
-                report = await model.retentionPreview()
-            }
+            let report = await model.retentionPreview(for: policy)
             withAnimation(Self.quickFade) {
-                if let report {
-                    cleanupOutcome = prune ? .applied(report) : .preview(report)
-                }
+                cleanupOutcome = report.map(CleanupOutcome.preview) ?? .previewFailed
+                isCleaningUp = false
+            }
+        }
+    }
+
+    /// Previews the draft first so the confirmation can say how many items
+    /// will be deleted. Nothing to delete applies without asking.
+    private func confirmCleanup() {
+        guard let policy = draftPolicy, !isCleaningUp else { return }
+        isCleaningUp = true
+        Task {
+            let report = await model.retentionPreview(for: policy)
+            isCleaningUp = false
+            if report?.itemCount == 0 {
+                applyCleanup(policy)
+            } else {
+                pendingCleanup = PendingCleanup(policy: policy, report: report)
+                confirmsCleanup = true
+            }
+        }
+    }
+
+    private func applyCleanup(_ policy: RetentionPolicy) {
+        guard !isCleaningUp else { return }
+        isCleaningUp = true
+        Task {
+            let report = await model.updateRetention(policy, pruneImmediately: true)
+            withAnimation(Self.quickFade) {
+                cleanupOutcome = report.map(CleanupOutcome.applied) ?? .applyFailed
                 isCleaningUp = false
             }
         }
@@ -642,7 +763,10 @@ struct PreferencesView: View {
                 let path = (url.path as NSString).abbreviatingWithTildeInPath
                 cliFeedback = Feedback(message: "Installed at \(path)", isError: false)
             } catch {
-                cliFeedback = Feedback(message: error.localizedDescription, isError: true)
+                cliFeedback = Feedback(
+                    message: "Couldn't install the command line tool. \(error.localizedDescription)",
+                    isError: true
+                )
             }
         }
     }
@@ -672,18 +796,22 @@ struct PreferencesView: View {
             exportFeedback = nil
         }
         Task {
-            let feedback: Feedback
+            let feedback: Feedback?
             do {
                 // The save panel already confirmed replacing an existing file.
-                let summary = try await model.export(
+                // Success is announced by the model's HUD, with Show in Finder.
+                _ = try await model.export(
                     to: url,
                     scope: .all,
                     passphrase: passphrase,
                     overwrite: true
                 )
-                feedback = Feedback(message: AppModel.exportMessage(summary), isError: false)
+                feedback = nil
             } catch {
-                feedback = Feedback(message: error.localizedDescription, isError: true)
+                feedback = Feedback(
+                    message: "Couldn't export your data. \(error.localizedDescription)",
+                    isError: true
+                )
             }
             withAnimation(Self.quickFade) {
                 exportFeedback = feedback

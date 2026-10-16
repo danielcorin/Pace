@@ -120,6 +120,36 @@ public actor HistoryStore {
         return record
     }
 
+    /// Puts back an item exactly as it was before deletion (Undo), without
+    /// the retention pass `add` runs: restoring must not evict the item it
+    /// restores. If the same content was copied again since, that newer copy
+    /// folds into the restored item, which keeps its ID, pin, and usage.
+    @discardableResult
+    public func restore(_ deleted: ClipboardItem) throws -> ClipboardRecord {
+        _ = try requireKey()
+        var item = deleted
+        if let existing = records.first(where: {
+            $0.fingerprint == deleted.fingerprint && $0.id != deleted.id
+        }), let newer = try? self.item(id: existing.id) {
+            item.copyCount += newer.copyCount
+            item.useCount += newer.useCount
+            item.isPinned = item.isPinned || newer.isPinned
+            if newer.lastCopiedAt > item.lastCopiedAt {
+                item.lastCopiedAt = newer.lastCopiedAt
+                item.source = newer.source
+            }
+            if let used = newer.lastUsedAt, used > (item.lastUsedAt ?? .distantPast) {
+                item.lastUsedAt = used
+            }
+            try? FileManager.default.removeItem(at: entryURL(id: existing.id))
+            records.removeAll { $0.id == existing.id }
+        }
+        try write(item)
+        replaceRecord(for: item)
+        try saveCatalog()
+        return ClipboardRecord(item: item)
+    }
+
     public func updateOCR(id: UUID, observations: [OCRObservation]) throws {
         var item = try self.item(id: id)
         item.ocrObservations = observations
@@ -189,6 +219,11 @@ public actor HistoryStore {
 
     public func retentionPreview() throws -> RetentionReport {
         try prune(using: policy, apply: false)
+    }
+
+    /// What `policy` would remove, without saving it.
+    public func retentionPreview(for policy: RetentionPolicy) throws -> RetentionReport {
+        try prune(using: policy.validated(), apply: false)
     }
 
     public func pruneNow() throws -> RetentionReport {

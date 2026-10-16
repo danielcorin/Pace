@@ -37,6 +37,7 @@ final class HotKeyRecorderButton: NSButton {
 
     private var recording = false
     private var eventMonitor: Any?
+    private var hintReset: Task<Void, Never>?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -100,15 +101,29 @@ final class HotKeyRecorderButton: NSButton {
         }
         guard let shortcut = HotKeyShortcut.from(event: event, context: captureContext) else {
             NSSound.beep()
-            title = "Add ⌘, ⌥, or ⌃"
+            showInvalidKeyHint()
             return
         }
         finish(with: shortcut)
     }
 
+    /// Explains the rejected key briefly, then returns to the recording
+    /// prompt so the button doesn't look stuck on an error.
+    private func showInvalidKeyHint() {
+        title = "Add ⌘, ⌥, or ⌃"
+        hintReset?.cancel()
+        hintReset = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled, let self, self.recording else { return }
+            self.title = "Press shortcut…"
+        }
+    }
+
     private func finish(with shortcut: HotKeyShortcut?) {
         guard recording else { return }
         recording = false
+        hintReset?.cancel()
+        hintReset = nil
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
             self.eventMonitor = nil

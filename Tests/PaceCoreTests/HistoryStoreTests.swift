@@ -258,4 +258,61 @@ final class HistoryStoreTests: XCTestCase {
         XCTAssertEqual(allText, ["recognized text", "older text"])
         XCTAssertEqual(newestText, ["recognized text"])
     }
+
+    func testRestoreKeepsItemAtCapacityAndFoldsInNewerCopy() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PaceTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = HistoryStore(rootURL: root)
+        try await store.unlock(with: SymmetricKey(size: .bits256))
+        _ = try await store.setRetentionPolicy(
+            RetentionPolicy(
+                maximumAgeDays: nil,
+                maximumItemCount: 2,
+                maximumStorageBytes: nil,
+                protectsPinnedItems: true
+            ),
+            pruneImmediately: true
+        )
+
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        func item(_ text: String, at offset: TimeInterval) -> ClipboardItem {
+            ClipboardItem(
+                createdAt: start.addingTimeInterval(offset),
+                lastCopiedAt: start.addingTimeInterval(offset),
+                source: ClipboardSource(kind: .application, name: "Tests"),
+                kind: .text,
+                representations: [],
+                preview: text,
+                searchableText: text,
+                fingerprint: text,
+                byteCount: 5
+            )
+        }
+
+        let old = try await store.add(item("old", at: 0))
+        _ = try await store.add(item("newer", at: 10))
+        _ = try await store.recordUse(id: old.id)
+        let deleted = try await store.item(id: old.id)
+        try await store.delete(id: old.id)
+        _ = try await store.add(item("newest", at: 20))
+
+        // History is full again; restoring the oldest item must not evict it.
+        try await store.restore(deleted)
+        var ids = try await store.allRecords().map(\.id)
+        XCTAssertTrue(ids.contains(old.id))
+        XCTAssertEqual(ids.count, 3)
+
+        // A copy of the same content made before Undo folds into the
+        // restored item, which keeps its ID and usage history.
+        try await store.delete(id: old.id)
+        let recopied = try await store.add(item("old", at: 30))
+        try await store.restore(deleted)
+        ids = try await store.allRecords().map(\.id)
+        XCTAssertFalse(ids.contains(recopied.id))
+        let restored = try await store.item(id: old.id)
+        XCTAssertEqual(restored.copyCount, 2)
+        XCTAssertEqual(restored.useCount, 1)
+        XCTAssertEqual(restored.lastCopiedAt, start.addingTimeInterval(30))
+    }
 }

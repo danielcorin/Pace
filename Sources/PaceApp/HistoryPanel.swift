@@ -71,6 +71,12 @@ private struct SnippetEditorDraft: Equatable {
     }
 }
 
+private enum PanelMotion {
+    static let showDuration: TimeInterval = 0.18
+    static let hideDuration: TimeInterval = 0.1
+    static let showScale: CGFloat = 0.97
+}
+
 private enum PanelMetrics {
     static let width: CGFloat = 760
     static let listWidth: CGFloat = 300
@@ -78,6 +84,7 @@ private enum PanelMetrics {
     static let searchHeight: CGFloat = 44
     static let dividerHeight: CGFloat = 1
     static let listUnitHeight: CGFloat = 48
+    static let pausedBannerHeight: CGFloat = 30
     static let minimumVisibleUnits = 5
     static let maximumVisibleUnits = 8
 
@@ -88,10 +95,13 @@ private enum PanelMetrics {
         )
     }
 
-    static func preferredHeight(contentUnitCount: Int) -> CGFloat {
+    // The paused banner adds its own height rather than taking a row's, so
+    // the list keeps an exact grid of visible units for the ⌘-number slots.
+    static func preferredHeight(contentUnitCount: Int, showsPausedBanner: Bool = false) -> CGFloat {
         let visibleUnits = visibleUnitCount(contentUnitCount: contentUnitCount)
         return searchHeight
             + dividerHeight
+            + (showsPausedBanner ? pausedBannerHeight + dividerHeight : 0)
             + CGFloat(visibleUnits) * listUnitHeight
     }
 }
@@ -103,6 +113,7 @@ final class HistoryPanelCoordinator {
     private var panel: PacePanel?
     private var targetApplication: NSRunningApplication?
     private var wantsVisible = false
+    private var hideGeneration = 0
     private var keyObserver: NSObjectProtocol?
     private var escapeMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
@@ -120,14 +131,19 @@ final class HistoryPanelCoordinator {
             .store(in: &cancellables)
     }
 
-    var isVisible: Bool { panel?.isVisible == true }
+    // A panel fading out still reports isVisible to AppKit; it counts as
+    // hidden here so the hotkey reopens it instead of hiding it twice.
+    var isVisible: Bool { wantsVisible && panel?.isVisible == true }
 
     func toggle(scope: PacePanelScope) {
-        if isVisible, model.panelScope == scope { hide() }
+        if isVisible, model.panelScope == scope { hide(animated: true) }
         else { show(scope: scope) }
     }
 
     func show(scope: PacePanelScope = .clipboard) {
+        // Reopening mid-fade completes the pending hide first, so the panel
+        // comes back through the same fresh-open path.
+        if !wantsVisible, panel?.isVisible == true { finishHiding() }
         wantsVisible = true
         model.panelScope = scope
         let frontmost = NSWorkspace.shared.frontmostApplication
@@ -141,14 +157,19 @@ final class HistoryPanelCoordinator {
 
         let panel = panel ?? makePanel()
         self.panel = panel
+        let showsPausedBanner = scope == .clipboard && model.capturePaused && !model.records.isEmpty
         resizePanel(
             to: PanelMetrics.preferredHeight(
-                contentUnitCount: scope == .clipboard ? model.records.count : model.snippets.count
+                contentUnitCount: scope == .clipboard ? model.records.count : model.snippets.count,
+                showsPausedBanner: showsPausedBanner
             )
         )
         position(panel)
+        let wasVisible = panel.isVisible
+        if !wasVisible { panel.alphaValue = 0 }
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
+        if !wasVisible { animateIn(panel) }
         // Post on the next turn: on the very first show the SwiftUI view may
         // not have attached its onReceive subscriber yet, and a synchronous
         // post is missed — leaving the search field unfocused.
@@ -157,12 +178,68 @@ final class HistoryPanelCoordinator {
         }
     }
 
-    func hide() {
+    /// Paste and copy hide without animation so focus returns to the target
+    /// app at once; dismissals fade out.
+    func hide(animated: Bool = false) {
         wantsVisible = false
         quickLookController.close()
-        panel?.orderOut(nil)
+        hideGeneration &+= 1
+        guard animated, let panel, panel.isVisible else {
+            finishHiding()
+            return
+        }
+        let generation = hideGeneration
+        panel.ignoresMouseEvents = true
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = PanelMotion.hideDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            panel.animator().alphaValue = 0
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + PanelMotion.hideDuration) { [weak self] in
+            guard let self, self.hideGeneration == generation, !self.wantsVisible else { return }
+            self.finishHiding()
+        }
+    }
+
+    private func finishHiding() {
+        hideGeneration &+= 1
+        if let panel {
+            panel.orderOut(nil)
+            panel.alphaValue = 1
+            panel.ignoresMouseEvents = false
+        }
         model.query = ""
         model.snippetQuery = ""
+    }
+
+    // Purely visual: the panel is already key and taking input, so neither
+    // the fade nor the scale delays typing or the paste flow.
+    private func animateIn(_ panel: PacePanel) {
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = PanelMotion.showDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 1
+        }
+        guard !reduceMotion, let layer = panel.contentView?.layer else { return }
+        // Scale about the center regardless of where AppKit put the anchor.
+        let bounds = layer.bounds
+        let center = CGPoint(
+            x: bounds.midX - layer.anchorPoint.x * bounds.width,
+            y: bounds.midY - layer.anchorPoint.y * bounds.height
+        )
+        let scale = PanelMotion.showScale
+        var from = CATransform3DMakeTranslation(center.x, center.y, 0)
+        from = CATransform3DScale(from, scale, scale, 1)
+        from = CATransform3DTranslate(from, -center.x, -center.y, 0)
+        let spring = CASpringAnimation(keyPath: "transform")
+        spring.fromValue = NSValue(caTransform3D: from)
+        spring.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        spring.mass = 1
+        spring.stiffness = 420
+        spring.damping = 36
+        spring.duration = spring.settlingDuration
+        layer.add(spring, forKey: "paceShowScale")
     }
 
     private func makePanel() -> PacePanel {
@@ -236,7 +313,7 @@ final class HistoryPanelCoordinator {
                 Task { await self.model.copySnippet(snippet) }
             },
             onUnlock: { [weak self] in self?.unlockAndRestorePanel() },
-            onClose: { [weak self] in self?.hide() },
+            onClose: { [weak self] in self?.hide(animated: true) },
             onPreferredHeightChange: { [weak self] height in
                 self?.resizePanel(to: height)
             }
@@ -246,6 +323,8 @@ final class HistoryPanelCoordinator {
         // The root reports its preferred height explicitly; don't let the
         // hosting view install competing window-sizing constraints.
         hosting.sizingOptions = []
+        // Layer-backed so the open animation can scale the content.
+        hosting.wantsLayer = true
         panel.contentView = hosting
         return panel
     }
@@ -256,7 +335,7 @@ final class HistoryPanelCoordinator {
         guard !quickLookController.isVisible else { return }
         // Don't dismiss while an unlock is still settling.
         guard model.vaultState != .unlocking else { return }
-        hide()
+        hide(animated: true)
     }
 
     private func restoreFocusAfterQuickLook() {
@@ -309,6 +388,7 @@ struct HistoryView: View {
     }
 
     @EnvironmentObject private var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var searchFocused: Bool
     @State private var selection: UUID?
     @State private var lastFirstID: UUID?
@@ -347,7 +427,23 @@ struct HistoryView: View {
     }
 
     private var preferredPanelHeight: CGFloat {
-        PanelMetrics.preferredHeight(contentUnitCount: listContentUnitCount)
+        PanelMetrics.preferredHeight(
+            contentUnitCount: listContentUnitCount,
+            showsPausedBanner: showsPausedBanner
+        )
+    }
+
+    // An empty history shows the paused state in place of the list instead.
+    private var showsPausedBanner: Bool {
+        model.panelScope == .clipboard && model.capturePaused && !model.records.isEmpty
+    }
+
+    // Terms the current search matched on, for row highlighting. Filter
+    // tokens such as type: and app: are not part of the text.
+    private var searchTerms: [String] {
+        SearchQuery(model.query).text
+            .split(separator: " ")
+            .map(String.init)
     }
 
     var body: some View {
@@ -405,11 +501,8 @@ struct HistoryView: View {
         }
     }
 
-    // Unlocking is automatic and near-instant; this shows for a frame or two
-    // at most.
     private var lockedView: some View {
-        ProgressView()
-            .controlSize(.small)
+        UnlockingView()
     }
 
     private func failedView(_ message: String) -> some View {
@@ -533,6 +626,8 @@ struct HistoryView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.tertiary)
+                    .help("Clear Search")
+                    .accessibilityLabel("Clear search")
                 }
             }
             .padding(.horizontal, 14)
@@ -541,6 +636,12 @@ struct HistoryView: View {
             Divider()
                 .frame(height: PanelMetrics.dividerHeight)
 
+            if showsPausedBanner {
+                pausedBanner
+                Divider()
+                    .frame(height: PanelMetrics.dividerHeight)
+            }
+
             if model.records.isEmpty {
                 emptyState
             } else {
@@ -548,17 +649,13 @@ struct HistoryView: View {
                     recordList
                         .frame(width: PanelMetrics.listWidth)
                     Divider()
-                    if snippetEditorDraft != nil {
-                        snippetEditorPane
-                    } else {
-                        DetailPane(
-                            record: selectedRecord,
-                            derivedSnippet: selectedRecord.flatMap(model.snippetDerived),
-                            onQuickLook: onQuickLook,
-                            onSaveAsSnippet: { beginPromotion($0) },
-                            onOpenSnippet: openSnippet
-                        )
-                    }
+                    DetailPane(
+                        record: selectedRecord,
+                        derivedSnippet: selectedRecord.flatMap(model.snippetDerived),
+                        onQuickLook: onQuickLook,
+                        onSaveAsSnippet: { beginPromotion($0) },
+                        onOpenSnippet: openSnippet
+                    )
                 }
             }
         }
@@ -642,6 +739,8 @@ struct HistoryView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.tertiary)
+                    .help("Clear Search")
+                    .accessibilityLabel("Clear search")
                 }
                 Button { beginNewSnippet() } label: {
                     Image(systemName: "plus")
@@ -731,6 +830,12 @@ struct HistoryView: View {
             }
             .background(OverlayScrollerStyle(handle: snippetListScroll))
         }
+        .animation(
+            model.snippetQuery == lastSnippetQuery && lastSnippetFirstID != nil && !reduceMotion
+                ? .spring(response: 0.3, dampingFraction: 0.86)
+                : nil,
+            value: model.snippets.map(\.id)
+        )
         .overlay(alignment: .topTrailing) { snippetShortcutBadgeRail }
         .onChange(of: snippetSelection) { selected in
             guard let selected,
@@ -745,21 +850,20 @@ struct HistoryView: View {
             .padding(.trailing, 44)
             .frame(maxWidth: .infinity)
             .frame(height: PanelMetrics.listUnitHeight)
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.primary.opacity(snippetSelection == snippet.id ? 0.15 : 0))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-            )
+            .modifier(RowHighlight(isSelected: snippetSelection == snippet.id))
             .contentShape(Rectangle())
             .onTapGesture(count: 2) { onPasteSnippet(snippet) }
             .simultaneousGesture(TapGesture().onEnded { snippetSelection = snippet.id })
             .contextMenu {
                 Button("Paste") { onPasteSnippet(snippet) }
+                    .keyboardShortcut(contextMenuHint(.paste))
                 Button("Copy") { onCopySnippet(snippet) }
+                    .keyboardShortcut(contextMenuHint(.copy))
                 Divider()
                 Button("Edit…") { beginEditingSnippet(snippet) }
+                    .keyboardShortcut("e", modifiers: .command)
                 Button("Duplicate") { duplicateSnippet(snippet) }
+                    .keyboardShortcut("d", modifiers: .command)
                 Button(snippet.isExpansionEnabled ? "Disable Expansion" : "Enable Expansion") {
                     Task { await model.toggleSnippetExpansion(snippet) }
                 }
@@ -768,7 +872,8 @@ struct HistoryView: View {
                     Task { await model.toggleSnippetPin(snippet) }
                 }
                 Divider()
-                Button("Delete") { Task { await model.deleteSnippet(snippet) } }
+                Button("Delete", role: .destructive) { Task { await model.deleteSnippet(snippet) } }
+                    .keyboardShortcut(contextMenuHint(.delete))
             }
     }
 
@@ -819,18 +924,62 @@ struct HistoryView: View {
         }
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 10) {
-            Image(systemName: model.query.isEmpty ? "clipboard" : "magnifyingglass")
-                .font(.system(size: 28))
+    private var pausedBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "pause.circle.fill")
+                .foregroundStyle(.orange)
+            Text(pausedDescription)
                 .foregroundStyle(.secondary)
-            Text(model.query.isEmpty ? "No Clipboard History" : "No Results")
-                .font(.headline)
-            Text(model.query.isEmpty ? "Copy something to begin." : "Try a different search.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer()
+            Button("Resume") { model.resumeCapture() }
+                .buttonStyle(.borderless)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .font(.system(size: 12))
+        .padding(.horizontal, 14)
+        .frame(height: PanelMetrics.pausedBannerHeight)
+        .background(Color.orange.opacity(0.08))
+    }
+
+    private var pausedDescription: String {
+        guard let until = model.capturePausedUntil else { return "Capture paused" }
+        return "Capture paused until \(until.formatted(date: .omitted, time: .shortened))"
+    }
+
+    private var pausedEmptyMessage: String {
+        guard let until = model.capturePausedUntil else { return "Resume to start saving what you copy." }
+        return "Saving resumes at \(until.formatted(date: .omitted, time: .shortened))."
+    }
+
+    @ViewBuilder
+    private var emptyState: some View {
+        if model.query.isEmpty, model.capturePaused {
+            VStack(spacing: 10) {
+                Image(systemName: "pause.circle")
+                    .font(.system(size: 28))
+                    .foregroundStyle(.secondary)
+                Text("Capture Is Paused")
+                    .font(.headline)
+                Text(pausedEmptyMessage)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Button("Resume Capture") { model.resumeCapture() }
+                    .buttonStyle(.borderedProminent)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            VStack(spacing: 10) {
+                Image(systemName: model.query.isEmpty ? "clipboard" : "magnifyingglass")
+                    .font(.system(size: 28))
+                    .foregroundStyle(.secondary)
+                Text(model.query.isEmpty ? "No Clipboard History" : "No Results")
+                    .font(.headline)
+                Text(model.query.isEmpty ? "Copy something to begin." : "Try a different search.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
     }
 
     private var recordList: some View {
@@ -845,12 +994,7 @@ struct HistoryView: View {
             }
             .background(OverlayScrollerStyle(handle: listScroll))
         }
-        .animation(
-            pendingDeletion == nil
-                ? nil
-                : .easeOut(duration: Self.deletionAnimationDuration),
-            value: model.records.map(\.id)
-        )
+        .animation(recordListAnimation, value: model.records.map(\.id))
         .overlay(alignment: .topTrailing) { shortcutBadgeRail }
         .onChange(of: selection) { selected in
             if let selected { revealSelection(selected) }
@@ -864,6 +1008,17 @@ struct HistoryView: View {
                 revealSelection(selection)
             }
         }
+    }
+
+    // Evaluated as the new records render, before recordsDidChange catches
+    // lastQuery and lastFirstID up: a differing query means the change is a
+    // search result swap, which lands instantly. Pins, unpins, and new
+    // captures glide.
+    private var recordListAnimation: Animation? {
+        if pendingDeletion != nil { return .easeOut(duration: Self.deletionAnimationDuration) }
+        // Filling an empty list (after unlock) also lands instantly.
+        guard model.query == lastQuery, lastFirstID != nil, !reduceMotion else { return nil }
+        return .spring(response: 0.3, dampingFraction: 0.86)
     }
 
     // The ⌘-number badges live in an overlay on the viewport, not inside the
@@ -902,24 +1057,19 @@ struct HistoryView: View {
     }
 
     private func listRow(_ record: ClipboardRecord) -> some View {
-        ClipboardRow(record: record)
+        ClipboardRow(record: record, highlightTerms: searchTerms)
             .padding(.leading, 12)
             .padding(.trailing, 44)
             .frame(maxWidth: .infinity)
             .frame(height: PanelMetrics.listUnitHeight)
-            .background(
-                // Primary at low opacity reads as a neutral gray wash in both
-                // light and dark appearances.
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.primary.opacity(selection == record.id ? 0.15 : 0))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-            )
+            .modifier(RowHighlight(isSelected: selection == record.id))
             .contentShape(Rectangle())
             .onTapGesture(count: 2) { onPaste(record, .original) }
             // A plain single-tap gesture would wait out the double-click
             // window before firing; a simultaneous gesture selects instantly.
             .simultaneousGesture(TapGesture().onEnded { selection = record.id })
+            // Shortcuts on context-menu items are hints for the panel's key
+            // monitor; see contextMenuHint for why bare keys are left off.
             .contextMenu {
                 if record.kind == .image {
                     Button("Quick Look") { onQuickLook(record) }
@@ -928,13 +1078,18 @@ struct HistoryView: View {
                 Button(record.kind == .image ? "Paste Image" : "Paste") {
                     onPaste(record, .original)
                 }
+                .keyboardShortcut(contextMenuHint(.paste))
                 Button("Paste as Plain Text") { onPaste(record, .plainText) }
+                    .keyboardShortcut(contextMenuHint(.pastePlainText))
                     .disabled(record.kind == .image || record.kind == .files)
                 Button("Paste as Single Line") { onPaste(record, .trimmedSingleLine) }
+                    .keyboardShortcut(contextMenuHint(.pasteSingleLine))
                     .disabled((record.kind == .image || record.kind == .files) && !record.hasOCR)
                 Button("Paste OCR Text") { onPaste(record, .ocrText) }
+                    .keyboardShortcut(contextMenuHint(.pasteOCRText))
                     .disabled(!record.hasOCR)
                 Button("Copy") { onCopy(record, .original) }
+                    .keyboardShortcut(contextMenuHint(.copy))
                 Button("Copy OCR Text") { onCopy(record, .ocrText) }
                     .disabled(!record.hasOCR)
                 Divider()
@@ -949,7 +1104,11 @@ struct HistoryView: View {
                     Button(record.kind == .image ? "Save OCR Text as Snippet…" : "Save as Snippet…") {
                         beginPromotion(record)
                     }
+                    .keyboardShortcut(contextMenuHint(.saveAsSnippet))
                 }
+                Divider()
+                Button("Delete", role: .destructive) { deleteRecord(record) }
+                    .keyboardShortcut(contextMenuHint(.delete))
             }
     }
 
@@ -1088,7 +1247,17 @@ struct HistoryView: View {
     }
 
     private func deleteSelected() {
-        guard pendingDeletion == nil, let record = selectedRecord else { return }
+        guard let record = selectedRecord else { return }
+        deleteRecord(record)
+    }
+
+    private func deleteRecord(_ record: ClipboardRecord) {
+        guard pendingDeletion == nil else { return }
+        // Deleting another row leaves the selection where it is.
+        guard record.id == selectedRecord?.id else {
+            Task { await model.delete(record) }
+            return
+        }
         let index = model.records.firstIndex(where: { $0.id == record.id }) ?? 0
         let replacementID: UUID? = if index + 1 < model.records.count {
             model.records[index + 1].id
@@ -1225,7 +1394,7 @@ struct HistoryView: View {
     private func saveSnippetEditor() {
         guard let draft = snippetEditorDraft else { return }
         Task {
-            if let saved = await model.saveSnippet(draft.resolvedSnippet) {
+            if let saved = await model.saveSnippet(draft.resolvedSnippet, reportsFailure: false) {
                 snippetSelection = saved.id
                 snippetEditorError = nil
                 snippetEditorDraft = nil
@@ -1309,7 +1478,13 @@ struct HistoryView: View {
             return
         }
 
-        if queryChanged || firstID != lastFirstID {
+        // A different first row means a new capture only if the old one is
+        // still listed; deleting the top row (e.g. from its context menu while
+        // another row is selected) must leave the selection alone.
+        let topWasRemoved = lastFirstID.map { id in
+            !model.records.contains { $0.id == id }
+        } ?? false
+        if queryChanged || (firstID != lastFirstID && !topWasRemoved) {
             // The search narrowed, or a new/re-copied item landed on top:
             // the best (most recent) match becomes the selection, which also
             // snaps the scroll back into alignment.
@@ -1537,17 +1712,6 @@ private let panelByteFormatter: ByteCountFormatter = {
     return formatter
 }()
 
-private func kindLabel(_ kind: ClipboardContentKind) -> String {
-    switch kind {
-    case .text: return "Text"
-    case .richText: return "Rich Text"
-    case .url: return "Link"
-    case .image: return "Image"
-    case .files: return "Files"
-    case .unknown: return "Other"
-    }
-}
-
 private func kindIcon(_ kind: ClipboardContentKind) -> String {
     switch kind {
     case .text: return "text.alignleft"
@@ -1559,40 +1723,324 @@ private func kindIcon(_ kind: ClipboardContentKind) -> String {
     }
 }
 
-private struct ClipboardRow: View {
-    @EnvironmentObject private var model: AppModel
-    let record: ClipboardRecord
-    @State private var thumbnail: CachedItemImage?
+private enum KeyHints {
+    static func label(_ action: PanelAction) -> String {
+        "\(PanelShortcuts.shortcut(for: action).displayLabel) \(action.title)"
+    }
+
+    static func join(_ hints: [String]) -> String {
+        hints.joined(separator: " · ")
+    }
+}
+
+// Bolds and tints each case- and diacritic-insensitive occurrence of the
+// search terms. Row text is a few hundred characters at most, so a direct
+// scan per term stays cheap.
+private func highlightedText(_ string: String, terms: [String]) -> Text {
+    guard !terms.isEmpty else { return Text(string) }
+    let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive, .widthInsensitive]
+    var ranges: [Range<String.Index>] = []
+    for term in terms {
+        var searchRange = string.startIndex..<string.endIndex
+        while ranges.count < 32,
+              let found = string.range(of: term, options: options, range: searchRange) {
+            ranges.append(found)
+            searchRange = found.upperBound..<string.endIndex
+        }
+    }
+    guard !ranges.isEmpty else { return Text(string) }
+    ranges.sort { $0.lowerBound < $1.lowerBound }
+    var text = Text(verbatim: "")
+    var cursor = string.startIndex
+    for range in ranges {
+        // Overlapping matches from different terms merge into one run.
+        let start = max(range.lowerBound, cursor)
+        guard start < range.upperBound else { continue }
+        text = text
+            + Text(string[cursor..<start])
+            + Text(string[start..<range.upperBound]).bold().foregroundColor(.accentColor)
+        cursor = range.upperBound
+    }
+    return text + Text(string[cursor...])
+}
+
+// Hover lives in each row so moving the pointer re-renders one row rather
+// than the whole list.
+private struct RowHighlight: ViewModifier {
+    let isSelected: Bool
+    @State private var isHovered = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                // Primary at low opacity reads as a neutral gray wash in both
+                // light and dark appearances.
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.primary.opacity(isSelected ? 0.15 : isHovered ? 0.06 : 0))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+            )
+            .onHover { isHovered = $0 }
+    }
+}
+
+// Unlocking is automatic and usually near-instant; the label fades in only
+// once the wait is long enough to notice, so a quick unlock never flashes.
+private struct UnlockingView: View {
+    @State private var isRevealed = false
 
     var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 22))
+                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Unlocking…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .opacity(isRevealed ? 1 : 0)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            withAnimation(.easeIn(duration: 0.15).delay(0.15)) { isRevealed = true }
+        }
+    }
+}
+
+private struct LinkPresentation {
+    let host: String
+    let address: String
+
+    // Plain text counts as a link only when it is a single web address;
+    // Link items also accept other schemes that name a host.
+    init?(_ candidate: Substring, webOnly: Bool) {
+        guard candidate.utf8.count <= 4096 else { return nil }
+        let address = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !address.isEmpty,
+              !address.contains(where: \.isWhitespace),
+              let components = URLComponents(string: address),
+              let scheme = components.scheme?.lowercased(),
+              !webOnly || scheme == "http" || scheme == "https",
+              var host = components.host, !host.isEmpty
+        else { return nil }
+        if host.hasPrefix("www.") { host.removeFirst(4) }
+        self.host = host
+        self.address = address
+    }
+
+    init?(record: ClipboardRecord) {
+        switch record.kind {
+        case .url:
+            if let link = LinkPresentation(record.preview[...], webOnly: false) {
+                self = link
+                return
+            }
+            // Items with only a URL representation keep a placeholder
+            // preview; the address itself is in the searchable text.
+            for line in record.searchableText.split(separator: "\n", maxSplits: 8) {
+                if let link = LinkPresentation(line, webOnly: false) {
+                    self = link
+                    return
+                }
+            }
+            return nil
+        case .text, .richText:
+            guard let link = LinkPresentation(record.preview[...], webOnly: true) else { return nil }
+            self = link
+        case .image, .files, .unknown:
+            return nil
+        }
+    }
+}
+
+/// A panel shortcut to show on a context-menu item. An open menu matches
+/// key equivalents before acting on its highlighted item, so a bare Return or
+/// Space hint could run Paste when the user presses Return on another item;
+/// only shortcuts with a modifier are shown.
+private func contextMenuHint(_ action: PanelAction) -> KeyboardShortcut? {
+    guard let shortcut = PanelShortcuts.shortcut(for: action).keyboardShortcut,
+          !shortcut.modifiers.isEmpty
+    else { return nil }
+    return shortcut
+}
+
+// A single CSS-style color literal: #RGB, #RRGGBB, #RRGGBBAA,
+// rgb(), or rgba(), with comma- or space-separated channels.
+private enum ColorLiteral {
+    static func color(in text: String) -> NSColor? {
+        guard text.utf8.count <= 48 else { return nil }
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if value.hasPrefix("#") { return hex(value.dropFirst()) }
+        if value.hasPrefix("rgb") { return functional(value) }
+        return nil
+    }
+
+    /// `#RRGGBB` and `#RRGGBBAA` always; `#RGB` only with a hex letter, so
+    /// issue references like `#123` and `#1234` stay text. `#RGBA` is skipped
+    /// for the same reason (`#1234`, `#cafe`).
+    private static func hex(_ digits: Substring) -> NSColor? {
+        guard [3, 6, 8].contains(digits.count),
+              digits.allSatisfy(\.isHexDigit),
+              digits.count != 3 || digits.contains(where: \.isLetter),
+              let raw = UInt64(digits, radix: 16)
+        else { return nil }
+        let short = digits.count == 3
+        let count = short ? digits.count : digits.count / 2
+        let bits: UInt64 = short ? 4 : 8
+        let mask: UInt64 = short ? 0xF : 0xFF
+        let channels = (0..<count).map { index -> CGFloat in
+            let shift = bits * UInt64(count - 1 - index)
+            return CGFloat((raw >> shift) & mask) / CGFloat(mask)
+        }
+        return NSColor(
+            srgbRed: channels[0],
+            green: channels[1],
+            blue: channels[2],
+            alpha: channels.count > 3 ? channels[3] : 1
+        )
+    }
+
+    private static func functional(_ value: String) -> NSColor? {
+        let arguments: Substring
+        if value.hasPrefix("rgba(") { arguments = value.dropFirst(5) }
+        else if value.hasPrefix("rgb(") { arguments = value.dropFirst(4) }
+        else { return nil }
+        guard arguments.hasSuffix(")") else { return nil }
+        let parts = arguments.dropLast().split { $0 == "," || $0 == "/" || $0 == " " }
+        guard parts.count == 3 || parts.count == 4 else { return nil }
+        var channels: [CGFloat] = []
+        for (index, part) in parts.enumerated() {
+            let isPercent = part.hasSuffix("%")
+            guard let number = Double(isPercent ? part.dropLast() : part), number.isFinite else {
+                return nil
+            }
+            let scale: Double = isPercent ? 100 : (index < 3 ? 255 : 1)
+            channels.append(CGFloat(min(max(number / scale, 0), 1)))
+        }
+        return NSColor(
+            srgbRed: channels[0],
+            green: channels[1],
+            blue: channels[2],
+            alpha: channels.count > 3 ? channels[3] : 1
+        )
+    }
+}
+
+@MainActor
+private enum FileIconCache {
+    /// Boxes the lookup result so missing files are remembered too.
+    private final class Entry {
+        let icon: NSImage?
+        init(_ icon: NSImage?) { self.icon = icon }
+    }
+
+    private static let icons = NSCache<NSString, Entry>()
+
+    // The real Finder icon for a copied file (or a stacked icon for
+    // several), when the files still exist.
+    static func icon(for record: ClipboardRecord) async -> NSImage? {
+        let lines = record.searchableText
+            .split(separator: "\n")
+            .filter { $0.hasPrefix("file://") }
+            .prefix(8)
+            .map(String.init)
+        guard !lines.isEmpty else { return nil }
+        let key = lines.joined(separator: "\n") as NSString
+        if let entry = icons.object(forKey: key) { return entry.icon }
+        // Resolving reference URLs and checking existence touch the disk,
+        // which can block for seconds on an unreachable network volume.
+        let icon = await Task.detached(priority: .utility) { lookup(lines) }.value
+        icons.setObject(Entry(icon), forKey: key)
+        return icon
+    }
+
+    nonisolated private static func lookup(_ lines: [String]) -> NSImage? {
+        let paths = lines.compactMap { line -> String? in
+            guard let url = URL(string: line) else { return nil }
+            // Finder copies file reference URLs (file:///.file/id=…).
+            return ((url as NSURL).filePathURL ?? url).path
+        }
+        let existing = paths.filter { FileManager.default.fileExists(atPath: $0) }
+        guard let first = existing.first else { return nil }
+        return existing.count == 1
+            ? NSWorkspace.shared.icon(forFile: first)
+            : NSWorkspace.shared.icon(forFiles: existing) ?? NSWorkspace.shared.icon(forFile: first)
+    }
+}
+
+private struct ClipboardRow: View {
+    // Items captured before the kind labels were unified carry these
+    // placeholder previews.
+    private static let legacyPlaceholders: [ClipboardContentKind: String] = [
+        .url: "URL",
+        .richText: "Rich text",
+        .unknown: "Clipboard item"
+    ]
+
+    @EnvironmentObject private var model: AppModel
+    let record: ClipboardRecord
+    let highlightTerms: [String]
+    @State private var thumbnail: CachedItemImage?
+    @State private var fileIcon: NSImage?
+
+    var body: some View {
+        let link = LinkPresentation(record: record)
         HStack(spacing: 10) {
-            leadingIcon
+            leadingIcon(isLink: link != nil)
                 .frame(width: 28, height: 28)
-            Text(title)
-                .font(.system(size: 13))
-                .lineLimit(1)
+            if let link {
+                VStack(alignment: .leading, spacing: 1) {
+                    highlightedText(link.host, terms: highlightTerms)
+                        .font(.system(size: 13))
+                        .lineLimit(1)
+                    highlightedText(link.address, terms: highlightTerms)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            } else {
+                highlightedText(title, terms: highlightTerms)
+                    .font(.system(size: 13))
+                    .lineLimit(1)
+            }
             Spacer(minLength: 6)
             if model.snippetDerived(from: record) != nil {
                 Image(systemName: "text.quote")
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(.blue)
                     .help("Saved as a snippet")
+                    .accessibilityLabel("Saved as a snippet")
             }
             if record.isPinned {
                 Image(systemName: "pin.fill")
                     .font(.system(size: 9))
                     .foregroundStyle(.orange)
+                    .help("Pinned")
+                    .accessibilityLabel("Pinned")
             }
         }
         .padding(.vertical, 2)
         .task(id: record.id) {
-            guard record.kind == .image, thumbnail == nil else { return }
-            thumbnail = await model.itemImage(for: record, maxPixelSize: 64)
+            switch record.kind {
+            case .image:
+                guard thumbnail == nil else { return }
+                thumbnail = await model.itemImage(for: record, maxPixelSize: 64)
+            case .files:
+                guard fileIcon == nil else { return }
+                fileIcon = await FileIconCache.icon(for: record)
+            case .text, .richText, .url, .unknown:
+                break
+            }
         }
     }
 
     @ViewBuilder
-    private var leadingIcon: some View {
+    private func leadingIcon(isLink: Bool) -> some View {
         if let thumbnail {
             Image(nsImage: thumbnail.image)
                 .resizable()
@@ -1603,13 +2051,32 @@ private struct ClipboardRow: View {
                     RoundedRectangle(cornerRadius: 5, style: .continuous)
                         .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
                 )
+        } else if let fileIcon {
+            Image(nsImage: fileIcon)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 28, height: 28)
+        } else if let swatch = swatchColor {
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(Color(nsColor: swatch))
+                .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
+                )
+                .frame(width: 28, height: 28)
         } else {
-            Image(systemName: kindIcon(record.kind))
+            Image(systemName: isLink ? "link" : kindIcon(record.kind))
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: 28, height: 28)
                 .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
         }
+    }
+
+    private var swatchColor: NSColor? {
+        guard record.kind == .text || record.kind == .richText else { return nil }
+        return ColorLiteral.color(in: record.preview)
     }
 
     private var title: String {
@@ -1619,7 +2086,10 @@ private struct ClipboardRow: View {
             }
             return "Image"
         }
-        return record.preview.isEmpty ? kindLabel(record.kind) : record.preview
+        if record.preview.isEmpty || Self.legacyPlaceholders[record.kind] == record.preview {
+            return record.kind.displayName
+        }
+        return record.preview
     }
 }
 
@@ -1695,7 +2165,7 @@ private struct DetailPane: View {
     private func information(for record: ClipboardRecord) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             infoRow("Source", record.source.name)
-            infoRow("Content type", kindLabel(record.kind))
+            infoRow("Content type", record.kind.displayName)
             if record.kind == .image, let pixels = image?.pixelSize, pixels.width > 0 {
                 infoRow("Dimensions", "\(Int(pixels.width))×\(Int(pixels.height))")
             }
@@ -1708,16 +2178,17 @@ private struct DetailPane: View {
                     infoRow("Last used in Pace", lastUsedAt.formatted(date: .abbreviated, time: .shortened))
                 }
             }
-            if canSaveAsSnippet(record) {
-                Divider().padding(.vertical, 2)
-                HStack {
+            Divider().padding(.vertical, 2)
+            HStack {
+                keyHints(for: record)
+                Spacer()
+                if canSaveAsSnippet(record) {
                     if let derivedSnippet {
                         Button("Open \(derivedSnippet.keyword ?? derivedSnippet.name)") {
                             onOpenSnippet(derivedSnippet)
                         }
                         .buttonStyle(.borderless)
                     }
-                    Spacer()
                     Button(record.kind == .image ? "Save OCR as Snippet…" : "Save as Snippet…") {
                         onSaveAsSnippet(record)
                     }
@@ -1737,6 +2208,22 @@ private struct DetailPane: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
+    }
+
+    // Read from the configured shortcuts; falls back to the essentials when
+    // the snippet buttons leave too little room.
+    private func keyHints(for record: ClipboardRecord) -> some View {
+        let paste = KeyHints.label(.paste)
+        let copy = KeyHints.label(.copy)
+        var full = [paste, copy]
+        if record.kind == .image { full.append("Space Quick Look") }
+        full.append(KeyHints.label(.delete))
+        return ViewThatFits(in: .horizontal) {
+            Text(KeyHints.join(full)).lineLimit(1)
+            Text(KeyHints.join([paste, copy])).lineLimit(1)
+        }
+        .font(.system(size: 10))
+        .foregroundStyle(.tertiary)
     }
 
     private func canSaveAsSnippet(_ record: ClipboardRecord) -> Bool {
@@ -1787,6 +2274,8 @@ private struct SnippetRow: View {
                 Image(systemName: "pin.fill")
                     .font(.system(size: 9))
                     .foregroundStyle(.orange)
+                    .help("Pinned")
+                    .accessibilityLabel("Pinned")
             }
         }
         .padding(.vertical, 2)
@@ -1832,7 +2321,7 @@ private struct SnippetDetailPane: View {
                     infoRow("Modified", snippet.updatedAt.formatted(date: .abbreviated, time: .shortened))
                     Divider().padding(.vertical, 2)
                     HStack {
-                        Text("Return to paste · ⌘Return to copy")
+                        Text(KeyHints.join([KeyHints.label(.paste), KeyHints.label(.copy)]))
                             .font(.system(size: 10))
                             .foregroundStyle(.tertiary)
                         Spacer()

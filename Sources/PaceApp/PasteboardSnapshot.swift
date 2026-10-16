@@ -140,14 +140,7 @@ struct PasteboardSnapshot: Sendable {
                 .compactMap { URL(string: $0)?.lastPathComponent }
             if !paths.isEmpty { return paths.joined(separator: ", ").prefixString(240) }
         }
-        switch kind {
-        case .image: return "Image"
-        case .files: return "Files"
-        case .url: return "URL"
-        case .richText: return "Rich text"
-        case .text: return "Text"
-        case .unknown: return "Clipboard item"
-        }
+        return kind.displayName
     }
 
     private func inferredSearchableText(preview: String) -> String {
@@ -173,6 +166,21 @@ struct PasteboardSnapshot: Sendable {
     private static func textValue(from data: Data) -> String? {
         if let text = String(data: data, encoding: .utf8) { return text }
         return (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? String
+    }
+}
+
+extension ClipboardContentKind {
+    /// The user-facing name for each kind, shared by captured previews and
+    /// the history panel.
+    var displayName: String {
+        switch self {
+        case .text: return "Text"
+        case .richText: return "Rich Text"
+        case .url: return "Link"
+        case .image: return "Image"
+        case .files: return "Files"
+        case .unknown: return "Other"
+        }
     }
 }
 

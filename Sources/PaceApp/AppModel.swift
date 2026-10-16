@@ -74,6 +74,7 @@ final class AppModel: ObservableObject {
     private var hasLoadedConfiguration = false
     private let ocrService = OCRService()
     private let accessibilityGuide = AccessibilityGuide()
+    private let feedbackHUD = FeedbackHUD()
     private var monitor: ClipboardMonitor!
     private var expansionMonitor: SnippetExpansionMonitor!
     private var searchTask: Task<Void, Never>?
@@ -95,6 +96,21 @@ final class AppModel: ObservableObject {
     private var distributedObservers: [NSObjectProtocol] = []
     private var menuObserver: NSObjectProtocol?
     private var securityGeneration = 0
+    /// The last deleted record or snippet, kept briefly so the HUD's Undo can
+    /// restore it. Cleared on lock: decrypted content must not outlive it.
+    private var lastDeletion: (token: UUID, value: DeletedValue)?
+    private var lastDeletionExpiry: Task<Void, Never>?
+    private var sensitiveSkipCount = 0
+    private var lastSensitiveSkipAt = Date.distantPast
+
+    private enum DeletedValue {
+        case record(ClipboardItem)
+        case snippet(Snippet)
+    }
+
+    private static let undoWindow: TimeInterval = 6
+    private static let accessibilityPasteMessage =
+        "Grant Accessibility access from the Pace menu bar icon to paste directly. The item is still on your clipboard."
 
     init(rootURL: URL = PacePaths.applicationSupportDirectory) {
         store = HistoryStore(rootURL: rootURL)
@@ -210,8 +226,16 @@ final class AppModel: ObservableObject {
             await store.lock()
             await snippetStore.lock()
             await usageStore.lock()
-            vaultState = .failed(error.localizedDescription)
-            statusMessage = error.localizedDescription
+            let message = Self.unlockFailureReason(for: error)
+            vaultState = .failed(message)
+            notify(
+                "Couldn't unlock Pace",
+                style: .error,
+                symbol: "lock.fill",
+                action: FeedbackAction(title: "Try Again") { [weak self] in
+                    Task { await self?.unlock() }
+                }
+            )
         }
     }
 
@@ -229,6 +253,11 @@ final class AppModel: ObservableObject {
         // Decrypted content must not outlive the vault lock.
         itemImageCache.removeAllObjects()
         itemTextCache.removeAllObjects()
+        if lastDeletion != nil {
+            // Its Undo button can no longer do anything.
+            feedbackHUD.dismiss()
+            expireLastDeletion()
+        }
         vaultState = .locked
     }
 
@@ -279,7 +308,7 @@ final class AppModel: ObservableObject {
                 if excluded { configuration.excludedApps.append(bundleIdentifier) }
             }
         } catch {
-            statusMessage = error.localizedDescription
+            notifyFailure(error, doing: "update the excluded apps")
         }
         reloadConfigurationIfNeeded(force: true)
     }
@@ -288,7 +317,8 @@ final class AppModel: ObservableObject {
         to url: URL,
         scope: PaceExportScope,
         passphrase: String?,
-        overwrite: Bool
+        overwrite: Bool,
+        announcesResult: Bool = true
     ) async throws -> PaceExportSummary {
         if let passphrase, passphrase.count < PaceExportCodec.minimumPassphraseLength {
             throw PaceError.invalidArgument(
@@ -307,13 +337,22 @@ final class AppModel: ObservableObject {
             try PaceExportCodec.write(output, to: url, overwrite: overwrite)
             return Int64(output.count)
         }.value
-        return PaceExportSummary(
+        let summary = PaceExportSummary(
             path: url.path,
             clipboardItemCount: items?.count ?? 0,
             snippetCount: snippets?.count ?? 0,
             byteCount: byteCount,
             isEncrypted: passphrase != nil
         )
+        if announcesResult {
+            notify(
+                Self.exportNotice(summary),
+                action: FeedbackAction(title: "Show in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                }
+            )
+        }
+        return summary
     }
 
     func refresh(updateStorageSummary: Bool = true) async {
@@ -328,7 +367,9 @@ final class AppModel: ObservableObject {
                 storageBytes = try await store.storageSummary().bytes
             }
         } catch {
-            if requestedQuery == query { statusMessage = error.localizedDescription }
+            // A lock that lands mid-refresh is expected, not worth a message.
+            guard requestedQuery == query, vaultState == .unlocked else { return }
+            notifyFailure(error, doing: "load your clipboard history")
         }
     }
 
@@ -349,7 +390,8 @@ final class AppModel: ObservableObject {
             guard requestedQuery == snippetQuery else { return }
             snippets = found
         } catch {
-            if requestedQuery == snippetQuery { statusMessage = error.localizedDescription }
+            guard requestedQuery == snippetQuery, vaultState == .unlocked else { return }
+            notifyFailure(error, doing: "load your snippets")
         }
     }
 
@@ -365,9 +407,9 @@ final class AppModel: ObservableObject {
             monitor.acknowledgeCurrentClipboard()
             _ = try await store.recordUse(id: record.id)
             await refresh(updateStorageSummary: false)
-            statusMessage = "Copied"
+            notify("Copied")
         } catch {
-            statusMessage = error.localizedDescription
+            notifyFailure(error, doing: "copy the item")
         }
     }
 
@@ -388,7 +430,7 @@ final class AppModel: ObservableObject {
             await recordUsage(.clipboardPaste)
             await refresh(updateStorageSummary: false)
         } catch {
-            statusMessage = error.localizedDescription
+            notifyPasteFailure(error, doing: "paste the item")
         }
     }
 
@@ -397,17 +439,29 @@ final class AppModel: ObservableObject {
             try await store.setPinned(id: record.id, pinned: !record.isPinned)
             await refresh()
         } catch {
-            statusMessage = error.localizedDescription
+            notifyFailure(error, doing: record.isPinned ? "unpin the item" : "pin the item")
         }
     }
 
+    /// Deletes right away and offers Undo, which writes the item back with
+    /// its original ID and timestamps, so it returns to its old position.
+    /// Deleting immediately means nothing needs flushing on sleep or quit.
+    /// An item that can't be read is still deleted, just without Undo.
     func delete(_ record: ClipboardRecord) async {
         do {
+            let item = try? await store.item(id: record.id)
             try await store.delete(id: record.id)
-            await refresh()
+            records.removeAll { $0.id == record.id }
+            if let item {
+                offerUndo(for: .record(item), message: "Deleted")
+            } else {
+                notify("Deleted", symbol: "trash.fill")
+            }
         } catch {
-            statusMessage = error.localizedDescription
+            notifyFailure(error, doing: "delete the item")
         }
+        // Also restores the row if the store kept it after a failure.
+        await refresh()
     }
 
     func snippetDerived(from record: ClipboardRecord) -> Snippet? {
@@ -419,7 +473,7 @@ final class AppModel: ObservableObject {
               let item = try? await store.item(id: record.id),
               let text = item.plainText ?? item.ocrText,
               !text.isEmpty else {
-            statusMessage = "This clipboard item does not contain text that can become a snippet."
+            notify("This item has no text to save as a snippet.", style: .info)
             return nil
         }
         let baseName = suggestedSnippetName(for: text, record: record)
@@ -440,8 +494,25 @@ final class AppModel: ObservableObject {
         )
     }
 
+    /// Saves and confirms with the HUD. Pass `reportsFailure: false` when the
+    /// caller shows the error itself; it is still left in `statusMessage`.
     @discardableResult
-    func saveSnippet(_ snippet: Snippet) async -> Snippet? {
+    func saveSnippet(_ snippet: Snippet, reportsFailure: Bool = true) async -> Snippet? {
+        let isNew = !snippetCatalog.contains { $0.id == snippet.id }
+        guard let saved = await persistSnippet(snippet, reportsFailure: reportsFailure) else {
+            return nil
+        }
+        if !isNew {
+            notify("Saved “\(saved.name)”")
+        } else if saved.sourceRecordID != nil {
+            notify("Saved as snippet “\(saved.name)”")
+        } else {
+            notify("Created “\(saved.name)”")
+        }
+        return saved
+    }
+
+    private func persistSnippet(_ snippet: Snippet, reportsFailure: Bool = true) async -> Snippet? {
         do {
             do {
                 _ = try SnippetTemplateRenderer.render(
@@ -456,34 +527,40 @@ final class AppModel: ObservableObject {
             let saved = try await snippetStore.upsert(snippet)
             await refreshSnippets()
             restartExpansionMonitor()
-            statusMessage = saved.keyword.map { "Saved as \($0)" } ?? "Snippet saved"
             return saved
         } catch {
-            statusMessage = error.localizedDescription
+            let message = friendlyMessage(for: error, doing: "save the snippet")
+            if reportsFailure { notify(message, style: .error) } else { statusMessage = message }
             return nil
         }
     }
 
+    /// Deletes right away; Undo saves the same snippet back, keeping its ID,
+    /// keyword, and usage history.
     func deleteSnippet(_ snippet: Snippet) async {
         do {
+            let current = (try? await snippetStore.snippet(id: snippet.id)) ?? snippet
             try await snippetStore.delete(id: snippet.id)
             await refreshSnippets()
             restartExpansionMonitor()
+            offerUndo(for: .snippet(current), message: "Deleted “\(current.name)”")
         } catch {
-            statusMessage = error.localizedDescription
+            notifyFailure(error, doing: "delete the snippet")
         }
     }
 
+    // The pin and expansion toggles are their own feedback; only failures
+    // reach the HUD.
     func toggleSnippetPin(_ snippet: Snippet) async {
         var edited = snippet
         edited.isPinned.toggle()
-        _ = await saveSnippet(edited)
+        _ = await persistSnippet(edited)
     }
 
     func toggleSnippetExpansion(_ snippet: Snippet) async {
         var edited = snippet
         edited.isExpansionEnabled.toggle()
-        _ = await saveSnippet(edited)
+        _ = await persistSnippet(edited)
     }
 
     func renderSnippet(_ snippet: Snippet) async throws -> RenderedSnippet {
@@ -497,16 +574,16 @@ final class AppModel: ObservableObject {
         do {
             _ = try await performPasteSnippet(snippet, into: target)
         } catch {
-            statusMessage = error.localizedDescription
+            notifyPasteFailure(error, doing: "paste the snippet")
         }
     }
 
     func copySnippet(_ snippet: Snippet) async {
         do {
             _ = try await performCopySnippet(snippet)
-            statusMessage = "Copied"
+            notify("Copied")
         } catch {
-            statusMessage = error.localizedDescription
+            notifyFailure(error, doing: "copy the snippet")
         }
     }
 
@@ -556,17 +633,17 @@ final class AppModel: ObservableObject {
             await refresh()
             return report
         } catch {
-            statusMessage = error.localizedDescription
+            notifyFailure(error, doing: "update history cleanup")
             return nil
         }
     }
 
-    func retentionPreview() async -> RetentionReport? {
-        do { return try await store.retentionPreview() }
-        catch {
-            statusMessage = error.localizedDescription
-            return nil
-        }
+    /// What `policy` would remove right now, without saving it. Settings use
+    /// this to preview a draft while it's edited, so an invalid draft or a
+    /// locked vault quietly returns nil.
+    func retentionPreview(for policy: RetentionPolicy) async -> RetentionReport? {
+        guard vaultState == .unlocked else { return nil }
+        return try? await store.retentionPreview(for: policy)
     }
 
     func itemImage(for record: ClipboardRecord, maxPixelSize: CGFloat) async -> CachedItemImage? {
@@ -649,7 +726,7 @@ final class AppModel: ObservableObject {
             }
             launchesAtLogin = SMAppService.mainApp.status == .enabled
         } catch {
-            statusMessage = error.localizedDescription
+            notifyFailure(error, doing: enabled ? "turn on Open at Login" : "turn off Open at Login")
             launchesAtLogin = SMAppService.mainApp.status == .enabled
         }
     }
@@ -667,6 +744,155 @@ final class AppModel: ObservableObject {
         // kTCCServiceAccessibility does not allow prompting"), so the guide
         // opens the pane and has the user drag Pace into its list.
         accessibilityGuide.start { [weak self] in self?.refreshPermissions() }
+    }
+
+    /// Shows a brief HUD below the menu bar. The text is also kept in
+    /// `statusMessage` for views that display the latest message inline.
+    func notify(
+        _ message: String,
+        style: FeedbackStyle = .success,
+        symbol: String? = nil,
+        action: FeedbackAction? = nil
+    ) {
+        statusMessage = message
+        feedbackHUD.show(message, style: style, symbol: symbol, action: action)
+    }
+
+    private func notifyFailure(_ error: Error, doing action: String) {
+        notify(friendlyMessage(for: error, doing: action), style: .error)
+    }
+
+    /// A paste that fails only for lack of Accessibility access still left
+    /// the content on the clipboard, so say that and offer the fix.
+    private func notifyPasteFailure(_ error: Error, doing action: String) {
+        guard let paceError = error as? PaceError,
+              paceError == .unavailable(Self.accessibilityPasteMessage) else {
+            notifyFailure(error, doing: action)
+            return
+        }
+        notify(
+            "Copied. Grant Accessibility access to paste directly.",
+            style: .warning,
+            symbol: "hand.raised.fill",
+            action: FeedbackAction(title: "Grant Access") { [weak self] in
+                self?.requestAccessibilityAccess()
+            }
+        )
+    }
+
+    /// "Couldn't <action>." followed by the underlying reason when it tells
+    /// the user something useful.
+    private func friendlyMessage(for error: Error, doing action: String) -> String {
+        guard let reason = Self.friendlyReason(for: error) else { return "Couldn't \(action)." }
+        return "Couldn't \(action). \(reason)"
+    }
+
+    private static func friendlyReason(for error: Error) -> String? {
+        var reason: String?
+        if let paceError = error as? PaceError {
+            switch paceError {
+            case .vaultLocked:
+                reason = "Unlock Pace and try again."
+            case .corruptStore:
+                reason = "The encrypted data couldn't be read."
+            case .notFound(let message):
+                // Store lookups name the missing item by UUID, which means
+                // nothing to the user.
+                reason = message.range(of: "[0-9A-Fa-f]{8}-", options: .regularExpression) == nil
+                    ? message
+                    : "It may have been deleted."
+            case .invalidArgument(let message), .unavailable(let message),
+                 .authenticationFailed(let message):
+                reason = message
+            }
+        } else if let cocoaError = error as? CocoaError, cocoaError.code == .fileWriteOutOfSpace {
+            reason = "The disk is full."
+        } else if let cocoaError = error as? CocoaError,
+                  cocoaError.code == .fileWriteNoPermission || cocoaError.code == .fileReadNoPermission {
+            reason = "Pace doesn't have permission to use that location."
+        } else {
+            let nsError = error as NSError
+            reason = nsError.localizedFailureReason ?? nsError.localizedDescription
+        }
+        guard let trimmed = reason?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else { return nil }
+        return trimmed.hasSuffix(".") || trimmed.hasSuffix("?") || trimmed.hasSuffix("!")
+            ? trimmed
+            : trimmed + "."
+    }
+
+    /// Shown under "Pace remains locked" in the panel, so it explains why and
+    /// what to do rather than restating the failure.
+    private static func unlockFailureReason(for error: Error) -> String {
+        switch error as? PaceError {
+        case .corruptStore?:
+            return "Your encrypted history couldn't be read. It may be damaged."
+        case .authenticationFailed(let message)?:
+            return "Pace couldn't get its key from your keychain. Make sure your login keychain is unlocked, then try again. (\(message))"
+        default:
+            return friendlyReason(for: error) ?? "Try again in a moment."
+        }
+    }
+
+    /// Password managers often write several values in a row, so a burst
+    /// updates one notice with a count instead of stacking messages.
+    private func noteSensitiveSkip() {
+        let now = Date()
+        sensitiveSkipCount = now.timeIntervalSince(lastSensitiveSkipAt) < 4 ? sensitiveSkipCount + 1 : 1
+        lastSensitiveSkipAt = now
+        notify(
+            sensitiveSkipCount == 1
+                ? "Skipped a sensitive item"
+                : "Skipped \(sensitiveSkipCount) sensitive items",
+            style: .info,
+            symbol: "lock.fill"
+        )
+    }
+
+    private func offerUndo(for value: DeletedValue, message: String) {
+        let token = UUID()
+        lastDeletionExpiry?.cancel()
+        lastDeletion = (token, value)
+        lastDeletionExpiry = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.undoWindow * 1_000_000_000))
+            guard !Task.isCancelled, self?.lastDeletion?.token == token else { return }
+            self?.lastDeletion = nil
+        }
+        notify(
+            message,
+            style: .info,
+            symbol: "trash.fill",
+            action: FeedbackAction(title: "Undo") { [weak self] in
+                Task { await self?.undoDeletion(token) }
+            }
+        )
+    }
+
+    private func undoDeletion(_ token: UUID) async {
+        guard let deletion = lastDeletion, deletion.token == token else { return }
+        expireLastDeletion()
+        do {
+            switch deletion.value {
+            case .record(let item):
+                // The item keeps its ID and timestamps, so it sorts back into
+                // its old place, and skips the retention pass a new copy gets.
+                try await store.restore(item)
+                await refresh()
+            case .snippet(let snippet):
+                _ = try await snippetStore.upsert(snippet)
+                await refreshSnippets()
+                restartExpansionMonitor()
+            }
+            notify("Restored", symbol: "arrow.uturn.backward.circle.fill")
+        } catch {
+            notifyFailure(error, doing: "restore it")
+        }
+    }
+
+    private func expireLastDeletion() {
+        lastDeletionExpiry?.cancel()
+        lastDeletionExpiry = nil
+        lastDeletion = nil
     }
 
     func handle(_ request: IPCRequest) async -> IPCResponse {
@@ -697,7 +923,10 @@ final class AppModel: ObservableObject {
             case .unlock:
                 await unlock()
                 guard vaultState == .unlocked else {
-                    throw PaceError.authenticationFailed(statusMessage ?? "Pace remains locked.")
+                    if case .failed(let reason) = vaultState {
+                        throw PaceError.authenticationFailed(reason)
+                    }
+                    throw PaceError.authenticationFailed("Pace remains locked.")
                 }
                 return IPCResponse(id: request.id, success: true, message: "Pace unlocked.")
 
@@ -928,7 +1157,8 @@ final class AppModel: ObservableObject {
                     to: URL(fileURLWithPath: path),
                     scope: scope,
                     passphrase: passphrase,
-                    overwrite: request.arguments["overwrite"] == "true"
+                    overwrite: request.arguments["overwrite"] == "true",
+                    announcesResult: false
                 )
                 return IPCResponse(
                     id: request.id,
@@ -942,14 +1172,29 @@ final class AppModel: ObservableObject {
         }
     }
 
-    static func exportMessage(_ summary: PaceExportSummary) -> String {
-        func count(_ value: Int, _ noun: String) -> String {
-            "\(value.formatted()) \(noun)\(value == 1 ? "" : "s")"
+    /// The HUD's short confirmation; Show in Finder stands in for the path.
+    private static func exportNotice(_ summary: PaceExportSummary) -> String {
+        switch (summary.clipboardItemCount, summary.snippetCount) {
+        case (0, 0):
+            return "Export saved"
+        case (let items, 0):
+            return "Exported \(counted(items, "item"))"
+        case (0, let snippets):
+            return "Exported \(counted(snippets, "snippet"))"
+        case (let items, let snippets):
+            return "Exported \(counted(items, "item")) and \(counted(snippets, "snippet"))"
         }
+    }
+
+    private static func counted(_ value: Int, _ noun: String) -> String {
+        "\(value.formatted()) \(noun)\(value == 1 ? "" : "s")"
+    }
+
+    static func exportMessage(_ summary: PaceExportSummary) -> String {
         let size = ByteCountFormatter.string(fromByteCount: summary.byteCount, countStyle: .file)
         let detail = summary.isEncrypted ? "\(size), encrypted" : size
-        return "Exported \(count(summary.clipboardItemCount, "clipboard item")) and "
-            + "\(count(summary.snippetCount, "snippet")) to \(summary.path) (\(detail))."
+        return "Exported \(counted(summary.clipboardItemCount, "clipboard item")) and "
+            + "\(counted(summary.snippetCount, "snippet")) to \(summary.path) (\(detail))."
     }
 
     private func capture(_ snapshot: PasteboardSnapshot) {
@@ -959,7 +1204,7 @@ final class AppModel: ObservableObject {
             return
         }
         if detector.isSensitive(typeIdentifiers: snapshot.typeIdentifiers, text: snapshot.plainText) {
-            statusMessage = "Sensitive clipboard item not saved"
+            noteSensitiveSkip()
             return
         }
 
@@ -972,7 +1217,8 @@ final class AppModel: ObservableObject {
                     scheduleOCR(for: record.id, imageData: imageData)
                 }
             } catch {
-                statusMessage = error.localizedDescription
+                guard vaultState == .unlocked else { return }
+                notifyFailure(error, doing: "save the copied item")
             }
         }
     }
@@ -985,7 +1231,7 @@ final class AppModel: ObservableObject {
                 let recognizedText = observations.map(\.text).joined(separator: "\n")
                 if detector.isSensitive(typeIdentifiers: [], text: recognizedText) {
                     try await store.delete(id: id)
-                    statusMessage = "Image containing sensitive text was not retained"
+                    noteSensitiveSkip()
                     await refresh()
                     return
                 }
@@ -1040,7 +1286,7 @@ final class AppModel: ObservableObject {
                 await self.recordUsage(.snippetExpansion)
                 await self.refreshSnippets()
             } catch {
-                self.statusMessage = error.localizedDescription
+                self.notifyPasteFailure(error, doing: "expand the snippet")
                 NSSound.beep()
             }
         }
@@ -1162,9 +1408,7 @@ final class AppModel: ObservableObject {
     ) async throws {
         refreshPermissions()
         guard hasAccessibilityAccess else {
-            throw PaceError.unavailable(
-                "Grant Accessibility access from the Pace menu bar icon to paste directly. The item is still on your clipboard."
-            )
+            throw PaceError.unavailable(Self.accessibilityPasteMessage)
         }
 
         let ownPID = ProcessInfo.processInfo.processIdentifier

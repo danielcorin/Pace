@@ -35,10 +35,27 @@ struct UsageStatsView: View {
                         }
                     } else if let loadError {
                         Section {
-                            Text(loadError)
-                                .foregroundStyle(.secondary)
+                            Label {
+                                Text(loadError)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            } icon: {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.orange)
+                            }
                         } header: {
                             periodPicker
+                        }
+                    } else {
+                        // Same shape as the loaded rows so nothing jumps
+                        // when the first report arrives.
+                        Section {
+                            placeholderRow(.clipboardPaste)
+                        } header: {
+                            periodPicker
+                        }
+                        Section {
+                            placeholderRow(.snippetExpansion)
                         }
                     }
                 }
@@ -67,7 +84,7 @@ struct UsageStatsView: View {
             report = loaded
             loadError = nil
         } catch {
-            loadError = error.localizedDescription
+            loadError = "Couldn't load usage stats. \(error.localizedDescription)"
         }
     }
 
@@ -98,6 +115,30 @@ struct UsageStatsView: View {
     }
 
     // MARK: - Metric
+
+    private func placeholderRow(_ event: UsageEvent) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(event.title)
+                        .font(.headline)
+                    Text("Loading…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Text("0")
+                    .font(.system(size: 26, weight: .semibold))
+                    .hidden()
+            }
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .fill(Color.secondary.opacity(0.08))
+                .overlay { ProgressView().controlSize(.small) }
+                .frame(height: 84)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(event.title), loading")
+    }
 
     private func metricRow(_ event: UsageEvent, report: UsageReport) -> some View {
         let hovered = report.buckets.first { $0.id == hoveredBucketID }

@@ -42,12 +42,12 @@ agents can read and write through a real CLI instead of UI automation.
 
 ## Using Pace
 
-1. Launch Pace and grant Accessibility permission when prompted (required to paste directly into other apps).
+1. Launch Pace, choose **Grant Accessibility Access…** from its menu bar icon, and drag the Pace icon that appears under System Settings into the Accessibility list (required to paste directly into other apps). The icon shows a dot until access is granted.
 2. Copy things. Pace captures them in the background.
 3. Press `Hyper+C` (`⌃⌥⇧⌘C`) to open clipboard history over your current app, search or arrow to an item, and press `⏎` to paste it into the app you came from.
 
 Double-clicking a row pastes it; right-clicking offers paste variants, copy,
-and pin. Use `↑` and `↓` to move through history, `⌘↑` and `⌘↓` to jump
+pin, and delete. Deletes can be undone from the confirmation that appears. Use `↑` and `↓` to move through history, `⌘↑` and `⌘↓` to jump
 to either end, and `⌘1`–`⌘9` to paste the rows currently aligned with those
 numbers. Press `⌘S` on a clipboard item to turn it into a snippet and open its
 configuration in the snippet library. The global hotkeys and the paste,
