@@ -19,8 +19,8 @@ configFiles:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "1.6.0"
-    CURRENT_PROJECT_VERSION: "9"
+    MARKETING_VERSION: "1.7.0"
+    CURRENT_PROJECT_VERSION: "10"
     CODE_SIGN_STYLE: Automatic
     ENABLE_HARDENED_RUNTIME: "YES"      # required for notarization
     GENERATE_INFOPLIST_FILE: "YES"
