@@ -26,9 +26,9 @@ TCC-reset comparison are load-bearing (see comments in the script).
 - Tell the user the new build is running. Pace is a menu-bar app with no Dock
   icon — point them at the clipboard icon in the menu bar.
 - If the script printed "clearing stale permission records", tell the user to
-  re-grant Accessibility: System Settings → Privacy & Security →
-  Accessibility. Current macOS won't self-register the app there, so they may
-  need the + button with /Applications/Pace.app.
+  re-grant Accessibility with "Grant Access…" in the Pace menu: it opens the
+  Accessibility pane and pins a draggable Pace icon under the window to drop
+  into the list.
 
 ## Failure notes
 

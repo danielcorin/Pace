@@ -246,6 +246,9 @@ private struct Command {
             if let enabled = status.isSnippetExpansionEnabled {
                 Swift.print("Expansion: \(enabled ? "enabled" : "disabled")")
             }
+            if let granted = status.hasAccessibilityAccess {
+                Swift.print("Accessibility: \(granted ? "granted" : "not granted")")
+            }
             return
         }
 

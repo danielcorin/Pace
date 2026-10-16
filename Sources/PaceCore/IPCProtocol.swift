@@ -58,6 +58,7 @@ public struct PaceStatus: Codable, Equatable, Sendable {
     public var storageBytes: Int64?
     public var snippetCount: Int?
     public var isSnippetExpansionEnabled: Bool?
+    public var hasAccessibilityAccess: Bool?
     public var retentionPolicy: RetentionPolicy
 
     public init(
@@ -67,6 +68,7 @@ public struct PaceStatus: Codable, Equatable, Sendable {
         storageBytes: Int64?,
         snippetCount: Int? = nil,
         isSnippetExpansionEnabled: Bool? = nil,
+        hasAccessibilityAccess: Bool? = nil,
         retentionPolicy: RetentionPolicy
     ) {
         self.isUnlocked = isUnlocked
@@ -75,6 +77,7 @@ public struct PaceStatus: Codable, Equatable, Sendable {
         self.storageBytes = storageBytes
         self.snippetCount = snippetCount
         self.isSnippetExpansionEnabled = isSnippetExpansionEnabled
+        self.hasAccessibilityAccess = hasAccessibilityAccess
         self.retentionPolicy = retentionPolicy
     }
 }

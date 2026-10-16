@@ -129,8 +129,7 @@ struct PaceApp: App {
             MenuBarContent()
                 .environmentObject(AppRuntime.shared.model)
         } label: {
-            Image("MenuBarIcon")
-                .accessibilityLabel("Pace")
+            MenuBarLabel(model: AppRuntime.shared.model)
         }
         .menuBarExtraStyle(.menu)
 
@@ -139,6 +138,42 @@ struct PaceApp: App {
                 .environmentObject(AppRuntime.shared.model)
         }
     }
+}
+
+/// Badges the menu bar icon while Pace lacks Accessibility access, so the
+/// missing grant is visible without opening the menu.
+private struct MenuBarLabel: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        if model.hasAccessibilityAccess {
+            Image("MenuBarIcon")
+                .accessibilityLabel("Pace")
+        } else {
+            Image(nsImage: Self.badgedIcon)
+                .accessibilityLabel("Pace, needs Accessibility access")
+        }
+    }
+
+    /// The template icon with a dot in its top-right corner. A clear ring is
+    /// knocked out around the dot so it reads against the glyph; staying a
+    /// template keeps it right on light, dark, and tinted menu bars.
+    private static let badgedIcon: NSImage = {
+        let base = NSImage(named: "MenuBarIcon") ?? NSImage()
+        let size = base.size
+        let image = NSImage(size: size, flipped: false) { rect in
+            base.draw(in: rect)
+            let dot = NSRect(x: size.width - 7, y: size.height - 7, width: 7, height: 7)
+            NSGraphicsContext.current?.compositingOperation = .clear
+            NSBezierPath(ovalIn: dot.insetBy(dx: -1.5, dy: -1.5)).fill()
+            NSGraphicsContext.current?.compositingOperation = .sourceOver
+            NSColor.black.setFill()
+            NSBezierPath(ovalIn: dot).fill()
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }()
 }
 
 // SettingsLink alone doesn't activate the app; when the menu bar item is
@@ -160,24 +195,35 @@ private struct SettingsMenuItem: View {
 private struct MenuBarContent: View {
     @EnvironmentObject private var model: AppModel
 
+    /// Full color so it stands out: menus render symbol images as monochrome
+    /// templates unless the image opts out.
+    private static let warningIcon: NSImage = {
+        let symbol = NSImage(
+            systemSymbolName: "exclamationmark.triangle.fill",
+            accessibilityDescription: "Action needed"
+        )
+        let colors = NSImage.SymbolConfiguration(paletteColors: [.black, .systemYellow])
+        let image = symbol?.withSymbolConfiguration(colors) ?? NSImage()
+        image.isTemplate = false
+        return image
+    }()
+
     var body: some View {
         if !model.hasAccessibilityAccess {
-            Text("Accessibility access is needed to paste")
-            Button(
-                model.hasPromptedForAccessibility
-                    ? "Open Accessibility Settings…"
-                    : "Grant Access…"
-            ) {
+            Button {
                 model.requestAccessibilityAccess()
+            } label: {
+                Label {
+                    Text("Grant Accessibility Access…")
+                } icon: {
+                    Image(nsImage: Self.warningIcon)
+                }
             }
-            if model.hasPromptedForAccessibility {
-                Text("If Pace isn't listed, add /Applications/Pace.app with the + button")
-            }
+            Text("Pace needs it to paste into other apps")
             Divider()
         }
 
         Button("Show Clipboard") { AppRuntime.shared.showPanel(scope: .clipboard) }
-            .onAppear { model.refreshPermissions() }
         Button("Show Snippets") { AppRuntime.shared.showPanel(scope: .snippets) }
 
         Divider()

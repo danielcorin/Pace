@@ -58,8 +58,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var capturePausedUntil: Date?
     @Published var statusMessage: String?
     @Published private(set) var launchesAtLogin = SMAppService.mainApp.status == .enabled
-    @Published private(set) var hasAccessibilityAccess = AXIsProcessTrusted()
-    @Published private(set) var hasPromptedForAccessibility = false
+    @Published private(set) var hasAccessibilityAccess = AccessibilityPermission.isGranted
     @Published private(set) var configuration = PaceConfiguration.defaults
     @Published private(set) var configurationError: String?
     /// Bumped whenever a usage event is recorded so open stats views reload.
@@ -74,6 +73,7 @@ final class AppModel: ObservableObject {
     private var configurationStamp: Date?
     private var hasLoadedConfiguration = false
     private let ocrService = OCRService()
+    private let accessibilityGuide = AccessibilityGuide()
     private var monitor: ClipboardMonitor!
     private var expansionMonitor: SnippetExpansionMonitor!
     private var searchTask: Task<Void, Never>?
@@ -93,6 +93,7 @@ final class AppModel: ObservableObject {
     }()
     private var workspaceObservers: [NSObjectProtocol] = []
     private var distributedObservers: [NSObjectProtocol] = []
+    private var menuObserver: NSObjectProtocol?
     private var securityGeneration = 0
 
     init(rootURL: URL = PacePaths.applicationSupportDirectory) {
@@ -143,6 +144,17 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in self?.updateExpansionState() }
             }
         )
+
+        // Access can be revoked at any time (System Settings, tccutil, or a
+        // reinstall with a new signature), so recheck whenever the menu bar
+        // menu opens. SwiftUI's onAppear on menu items fires only once.
+        menuObserver = NotificationCenter.default.addObserver(
+            forName: NSMenu.didBeginTrackingNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshPermissions() }
+        }
 
         let distributedCenter = DistributedNotificationCenter.default()
         distributedObservers.append(
@@ -643,60 +655,25 @@ final class AppModel: ObservableObject {
     }
 
     func refreshPermissions() {
-        // AXIsProcessTrusted always checks this process. The CG preflight
-        // (CGPreflightPostEventAccess) rides the current event's provenance,
-        // so a check triggered from a Karabiner-synthesized keystroke is
-        // evaluated against Karabiner — and reports access Pace doesn't have.
-        hasAccessibilityAccess = AXIsProcessTrusted()
+        let granted = AccessibilityPermission.isGranted
+        if granted != hasAccessibilityAccess { hasAccessibilityAccess = granted }
     }
 
     func requestAccessibilityAccess() {
         refreshPermissions()
         guard !hasAccessibilityAccess else { return }
 
-        // The consent dialog registers Pace in the Accessibility list and has
-        // its own "Open System Settings" button, so the first request lets
-        // the dialog drive — opening the pane from here as well races the
-        // dialog. macOS shows the dialog at most once per launch (and never
-        // after a denial); repeat requests open the pane directly instead.
-        guard !hasPromptedForAccessibility else {
-            openAccessibilitySettings()
-            return
-        }
-        hasPromptedForAccessibility = true
-
-        // On older macOS the prompt also registers the app in the
-        // Accessibility list; current releases refuse prompt-based
-        // registration ("Service kTCCServiceAccessibility does not allow
-        // prompting") and only show an informational dialog, so the pane's
-        // add button is the real path and the menu explains it.
-        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        _ = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
-
-        // The grant lands while the user works the dialog and Settings pane;
-        // poll so the menu reflects it without another click.
-        Task { [weak self] in
-            for _ in 0..<120 {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard let self else { return }
-                self.refreshPermissions()
-                if self.hasAccessibilityAccess { return }
-            }
-        }
-    }
-
-    private func openAccessibilitySettings() {
-        let anchor = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-        if let url = URL(string: anchor), NSWorkspace.shared.open(url) { return }
-        NSWorkspace.shared.open(
-            URL(fileURLWithPath: "/System/Applications/System Settings.app")
-        )
+        // Current macOS refuses prompt-based registration ("Service
+        // kTCCServiceAccessibility does not allow prompting"), so the guide
+        // opens the pane and has the user drag Pace into its list.
+        accessibilityGuide.start { [weak self] in self?.refreshPermissions() }
     }
 
     func handle(_ request: IPCRequest) async -> IPCResponse {
         do {
             switch request.command {
             case .status:
+                refreshPermissions()
                 let policy = await store.retentionPolicy()
                 let summary = vaultState == .unlocked ? try await store.storageSummary() : nil
                 let snippetCount = vaultState == .unlocked
@@ -712,6 +689,7 @@ final class AppModel: ObservableObject {
                         storageBytes: summary?.bytes,
                         snippetCount: snippetCount,
                         isSnippetExpansionEnabled: SnippetExpansionPreferences.isEnabled,
+                        hasAccessibilityAccess: hasAccessibilityAccess,
                         retentionPolicy: policy
                     )
                 )
