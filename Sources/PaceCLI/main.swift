@@ -21,7 +21,7 @@ struct PaceCLI {
         }
     }
 
-    private static func sendLaunchingPaceIfNeeded(_ request: IPCRequest) throws -> IPCResponse {
+    static func sendLaunchingPaceIfNeeded(_ request: IPCRequest) throws -> IPCResponse {
         do {
             return try LocalSocketClient.send(request)
         } catch PaceError.unavailable {
@@ -108,7 +108,7 @@ private struct Command {
     private static let booleanOptions: Set<String> = [
         "--clear-keyword", "--clear-tags", "--encrypt", "--expand", "--force",
         "--include-pinned", "--json", "--no-expand", "--ocr-text", "--pin", "--pinned", "--plain",
-        "--protect-pinned", "--prune", "--snippets", "--unpin"
+        "--protect-pinned", "--prune", "--snippets", "--unpin", "--yes"
     ]
 
     let name: String
@@ -583,6 +583,9 @@ private struct Command {
         case ("export", "decrypt"):
             try decryptExport()
             return true
+        case ("actions", _), ("action", _):
+            try ActionsCommand.run(values: values, options: options, flags: flags)
+            return true
         default:
             return false
         }
@@ -771,7 +774,7 @@ private struct Command {
 
     Usage:
       pace status|unlock|lock
-      pace show [--mode clipboard|snippets]
+      pace show [--mode clipboard|snippets|actions]
       pace list [--limit N] [--json]
       pace search <query> [--limit N] [--json]
       pace get <id> [--ocr-text|--output PATH] [--json]
@@ -790,6 +793,11 @@ private struct Command {
       pace stats [--period 7d|30d|90d|12m] [--json]
       pace config show|path [--json]
       pace config exclude|include <bundle-id|path/to/App.app>…
+
+      pace actions [list] [--json]
+      pace actions path
+      pace actions new <name> [--template blank|ask-claude|describe-image] [--force]
+      pace actions run <name> [--arg TEXT] [--file PATH|--item ID] [--yes] [--json]
 
       pace snippets show
       pace snippets list [--limit N] [--json]
@@ -817,6 +825,11 @@ private struct Command {
     passphrase (or reads PACE_EXPORT_PASSPHRASE) and seals the file with
     AES-256-GCM. `pace config` edits ~/.config/pace/config.toml, which the
     app re-reads on the next copy.
+
+    Actions are executable scripts in ~/.config/pace/actions. `pace actions run`
+    hands them the clipboard (or --file, --item, or piped stdin), streams their
+    output, and asks before running a confirm step they offer (--yes accepts).
+    Run `pace actions new <name>` for a template that documents the protocol.
 
     `pace stats` charts clipboard pastes and snippet keyword expansions per
     day (7d, 30d), week (90d), or month (12m). Defaults to 30d.

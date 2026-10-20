@@ -13,6 +13,13 @@ struct HotKeyShortcut: Equatable {
         modifiers: UInt32(cmdKey | optionKey | shiftKey | controlKey)
     )
 
+    static let defaultActionShortcut = HotKeyShortcut(
+        keyCode: UInt32(kVK_ANSI_X),
+        modifiers: UInt32(cmdKey | optionKey | shiftKey | controlKey)
+    )
+
+    static let actionDefaultsKey = "actionHotKeyChoice"
+
     static let previousDefaultShortcut = HotKeyShortcut(
         keyCode: UInt32(kVK_ANSI_V),
         modifiers: UInt32(cmdKey | optionKey)

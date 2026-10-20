@@ -6,6 +6,7 @@ import Foundation
 import ImageIO
 import PaceCore
 import ServiceManagement
+import UniformTypeIdentifiers
 
 final class CachedItemImage {
     let image: NSImage
@@ -587,6 +588,84 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Action results
+
+    func clipboardItem(for record: ClipboardRecord) async throws -> ClipboardItem {
+        try await store.item(id: record.id)
+    }
+
+    /// Pastes an action's text output and then puts the user's clipboard
+    /// back, like a snippet: results land in history only when copied.
+    func pasteActionText(_ text: String, into target: NSRunningApplication?) async {
+        do {
+            try await pasteRenderedSnippet(RenderedSnippet(text: text), into: target, restoresClipboard: true)
+        } catch {
+            notifyPasteFailure(error, doing: "paste the result")
+        }
+    }
+
+    func copyActionText(_ text: String, actionTitle: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        recordActionCopy(actionTitle: actionTitle)
+        notify("Copied")
+    }
+
+    /// Run folders are temporary, so copied attachments are first moved
+    /// somewhere that outlives the run; history keeps pointing at real files.
+    /// Images also carry their data so they paste into chat and mail apps.
+    func copyActionFiles(_ urls: [URL], actionTitle: String) {
+        guard !urls.isEmpty else { return }
+        let durable: [URL]
+        do {
+            durable = try ActionFileStore.keep(urls)
+        } catch {
+            notifyFailure(error, doing: "copy the file")
+            return
+        }
+        let items = durable.map { url -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            item.setString(url.absoluteString, forType: .fileURL)
+            if let type = UTType(filenameExtension: url.pathExtension),
+               [UTType.png, .jpeg, .tiff, .gif].contains(type),
+               let data = try? Data(contentsOf: url) {
+                item.setData(data, forType: NSPasteboard.PasteboardType(type.identifier))
+            }
+            return item
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects(items)
+        recordActionCopy(actionTitle: actionTitle)
+        notify(urls.count == 1 ? "Copied \(urls[0].lastPathComponent)" : "Copied \(urls.count) files")
+    }
+
+    /// Saves what Pace just put on the clipboard with the action as its
+    /// source, rather than leaving the monitor to credit whichever app is
+    /// frontmost.
+    private func recordActionCopy(actionTitle: String) {
+        monitor.acknowledgeCurrentClipboard()
+        guard vaultState == .unlocked, !capturePaused,
+              var snapshot = PasteboardSnapshot.capture() else { return }
+        snapshot.source = ClipboardSource(
+            kind: .application,
+            name: "Pace Action: \(actionTitle)",
+            bundleIdentifier: Bundle.main.bundleIdentifier
+        )
+        if detector.isSensitive(typeIdentifiers: snapshot.typeIdentifiers, text: snapshot.plainText) { return }
+        let item = snapshot.makeItem()
+        Task {
+            do {
+                _ = try await store.add(item)
+                await refresh()
+            } catch {
+                guard vaultState == .unlocked else { return }
+                notifyFailure(error, doing: "save the copied result")
+            }
+        }
+    }
+
     private func performPasteSnippet(
         _ snippet: Snippet,
         into target: NSRunningApplication?
@@ -1119,7 +1198,8 @@ final class AppModel: ObservableObject {
                 switch request.arguments["scope"]?.lowercased() {
                 case nil, "", "clipboard": scope = .clipboard
                 case "snippet", "snippets": scope = .snippets
-                default: throw PaceError.invalidArgument("--mode must be clipboard or snippets.")
+                case "action", "actions": scope = .actions
+                default: throw PaceError.invalidArgument("--mode must be clipboard, snippets, or actions.")
                 }
                 AppRuntime.shared.showPanel(scope: scope)
                 return IPCResponse(

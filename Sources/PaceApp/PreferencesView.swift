@@ -7,6 +7,7 @@ struct PreferencesView: View {
     @EnvironmentObject private var model: AppModel
     @AppStorage("hotKeyChoice") private var hotKeyRawValue = HotKeyShortcut.defaultShortcut.storedValue
     @AppStorage("snippetHotKeyChoice") private var snippetHotKeyRawValue = HotKeyShortcut.defaultSnippetShortcut.storedValue
+    @AppStorage(HotKeyShortcut.actionDefaultsKey) private var actionHotKeyRawValue = HotKeyShortcut.defaultActionShortcut.storedValue
     @AppStorage(SnippetExpansionPreferences.enabledKey) private var snippetExpansionEnabled = true
     @AppStorage(SnippetExpansionPreferences.modeKey) private var snippetExpansionMode = SnippetExpansionMode.immediately.rawValue
     @AppStorage(SnippetExpansionPreferences.restoreClipboardKey) private var restoresClipboardAfterExpansion = true
@@ -86,6 +87,10 @@ struct PreferencesView: View {
 
     private var currentSnippetShortcut: HotKeyShortcut {
         HotKeyShortcut(storedValue: snippetHotKeyRawValue) ?? .defaultSnippetShortcut
+    }
+
+    private var currentActionShortcut: HotKeyShortcut {
+        HotKeyShortcut(storedValue: actionHotKeyRawValue) ?? .defaultActionShortcut
     }
 
     // MARK: - General
@@ -271,6 +276,18 @@ struct PreferencesView: View {
                 } label: {
                     Text("Show Snippets")
                     Text("Global keyboard shortcut to open the snippet library")
+                }
+                LabeledContent {
+                    HotKeyRecorder(
+                        shortcut: currentActionShortcut,
+                        actionName: "Show Actions",
+                        onBeginRecording: { AppRuntime.shared.suspendHotKeys() },
+                        onComplete: finishActionRecording
+                    )
+                    .frame(width: 150, height: 28)
+                } label: {
+                    Text("Show Actions")
+                    Text("Global keyboard shortcut to run actions on the clipboard")
                 }
             }
 
@@ -669,6 +686,11 @@ struct PreferencesView: View {
             showShortcutConflict(with: "Show Snippets")
             return
         }
+        if shortcut == currentActionShortcut {
+            AppRuntime.shared.restoreHotKeys()
+            showShortcutConflict(with: "Show Actions")
+            return
+        }
         if let taken = PanelAction.allCases.first(where: { panelShortcut(for: $0) == shortcut }) {
             AppRuntime.shared.restoreHotKeys()
             showShortcutConflict(with: taken.title)
@@ -696,6 +718,11 @@ struct PreferencesView: View {
             showShortcutConflict(with: "Show Clipboard")
             return
         }
+        if shortcut == currentActionShortcut {
+            AppRuntime.shared.restoreHotKeys()
+            showShortcutConflict(with: "Show Actions")
+            return
+        }
         if let taken = PanelAction.allCases.first(where: { panelShortcut(for: $0) == shortcut }) {
             AppRuntime.shared.restoreHotKeys()
             showShortcutConflict(with: taken.title)
@@ -703,6 +730,34 @@ struct PreferencesView: View {
         }
         if AppRuntime.shared.updateSnippetHotKey(shortcut) {
             snippetHotKeyRawValue = shortcut.storedValue
+            AppRuntime.shared.restoreHotKeys()
+            withAnimation(Self.quickFade) { shortcutMessage = nil }
+        } else {
+            AppRuntime.shared.restoreHotKeys()
+            withAnimation(Self.quickFade) {
+                shortcutMessage = "That shortcut is already in use. Your previous shortcut is still active."
+            }
+        }
+    }
+
+    private func finishActionRecording(_ shortcut: HotKeyShortcut?) {
+        guard let shortcut else {
+            AppRuntime.shared.restoreHotKeys()
+            return
+        }
+        for (taken, name) in [(currentShortcut, "Show Clipboard"), (currentSnippetShortcut, "Show Snippets")]
+        where shortcut == taken {
+            AppRuntime.shared.restoreHotKeys()
+            showShortcutConflict(with: name)
+            return
+        }
+        if let taken = PanelAction.allCases.first(where: { panelShortcut(for: $0) == shortcut }) {
+            AppRuntime.shared.restoreHotKeys()
+            showShortcutConflict(with: taken.title)
+            return
+        }
+        if AppRuntime.shared.updateActionHotKey(shortcut) {
+            actionHotKeyRawValue = shortcut.storedValue
             AppRuntime.shared.restoreHotKeys()
             withAnimation(Self.quickFade) { shortcutMessage = nil }
         } else {
@@ -725,6 +780,10 @@ struct PreferencesView: View {
         }
         if shortcut == currentSnippetShortcut {
             showShortcutConflict(with: "Show Snippets")
+            return
+        }
+        if shortcut == currentActionShortcut {
+            showShortcutConflict(with: "Show Actions")
             return
         }
         if let taken = PanelAction.allCases.first(where: {

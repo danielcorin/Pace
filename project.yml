@@ -74,6 +74,11 @@ targets:
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.productivity"
         INFOPLIST_KEY_NSPrincipalClass: NSApplication
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        # Actions run user scripts as Pace's children, so macOS attributes
+        # their privacy requests (ical adding events, osascript) to Pace.
+        INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription: "Actions you run, such as one that adds events with the ical command, can read and add calendar events."
+        INFOPLIST_KEY_NSCalendarsUsageDescription: "Actions you run, such as one that adds events with the ical command, can read and add calendar events."
+        INFOPLIST_KEY_NSAppleEventsUsageDescription: "Actions you run can use AppleScript to control other apps."
     postBuildScripts:
       - name: Embed Pace CLI
         script: |
@@ -87,6 +92,8 @@ targets:
       path: App.entitlements
       properties:
         com.apple.security.app-sandbox: false
+        com.apple.security.personal-information.calendars: true
+        com.apple.security.automation.apple-events: true
 
   PaceCLI:
     type: tool

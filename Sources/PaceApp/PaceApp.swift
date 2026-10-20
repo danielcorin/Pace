@@ -8,9 +8,11 @@ final class AppRuntime {
     static let shared = AppRuntime()
 
     let model = AppModel()
-    private lazy var panel = HistoryPanelCoordinator(model: model)
+    private(set) lazy var actions = ActionCenter(model: model)
+    private lazy var panel = HistoryPanelCoordinator(model: model, actions: actions)
     private let hotKey = GlobalHotKey()
     private let snippetHotKey = GlobalHotKey()
+    private let actionHotKey = GlobalHotKey()
     private var socketServer: LocalSocketServer?
     private var welcomeWindow: WelcomeWindowController?
     private var started = false
@@ -21,9 +23,9 @@ final class AppRuntime {
         let showsWelcome = shouldShowWelcome()
         migrateDefaultHotKeysIfNeeded()
         model.start()
+        actions.start()
         Task { await model.unlock() }
-        _ = updateHotKey(rawValue: UserDefaults.standard.string(forKey: "hotKeyChoice"))
-        _ = updateSnippetHotKey(rawValue: UserDefaults.standard.string(forKey: "snippetHotKeyChoice"))
+        restoreHotKeys()
 
         let server = LocalSocketServer { [model] request in
             await model.handle(request)
@@ -41,6 +43,7 @@ final class AppRuntime {
     func stop() {
         socketServer?.stop()
         socketServer = nil
+        actions.discardAll()
     }
 
     func togglePanel(scope: PacePanelScope = .clipboard) { panel.toggle(scope: scope) }
@@ -66,14 +69,26 @@ final class AppRuntime {
         snippetHotKey.register(shortcut: shortcut) { [weak self] in self?.togglePanel(scope: .snippets) } == noErr
     }
 
+    @discardableResult
+    func updateActionHotKey(rawValue: String?) -> Bool {
+        updateActionHotKey(HotKeyShortcut(storedValue: rawValue) ?? .defaultActionShortcut)
+    }
+
+    @discardableResult
+    func updateActionHotKey(_ shortcut: HotKeyShortcut) -> Bool {
+        actionHotKey.register(shortcut: shortcut) { [weak self] in self?.togglePanel(scope: .actions) } == noErr
+    }
+
     func suspendHotKeys() {
         hotKey.unregister()
         snippetHotKey.unregister()
+        actionHotKey.unregister()
     }
 
     func restoreHotKeys() {
         _ = updateHotKey(rawValue: UserDefaults.standard.string(forKey: "hotKeyChoice"))
         _ = updateSnippetHotKey(rawValue: UserDefaults.standard.string(forKey: "snippetHotKeyChoice"))
+        _ = updateActionHotKey(rawValue: UserDefaults.standard.string(forKey: HotKeyShortcut.actionDefaultsKey))
     }
 
     func showWelcome() {
@@ -150,7 +165,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        Task { @MainActor in AppRuntime.shared.stop() }
+        // Synchronous: a Task would not run before the process exits, and
+        // action runs must be stopped and their staged input deleted.
+        MainActor.assumeIsolated { AppRuntime.shared.stop() }
     }
 }
 
@@ -255,6 +272,7 @@ private struct MenuBarContent: View {
     @EnvironmentObject private var model: AppModel
     @AppStorage("hotKeyChoice") private var hotKeyRawValue = HotKeyShortcut.defaultShortcut.storedValue
     @AppStorage("snippetHotKeyChoice") private var snippetHotKeyRawValue = HotKeyShortcut.defaultSnippetShortcut.storedValue
+    @AppStorage(HotKeyShortcut.actionDefaultsKey) private var actionHotKeyRawValue = HotKeyShortcut.defaultActionShortcut.storedValue
 
     /// Full color so it stands out: menus render symbol images as monochrome
     /// templates unless the image opts out.
@@ -288,6 +306,8 @@ private struct MenuBarContent: View {
             .menuShortcut((HotKeyShortcut(storedValue: hotKeyRawValue) ?? .defaultShortcut).keyboardShortcut)
         Button("Show Snippets") { AppRuntime.shared.showPanel(scope: .snippets) }
             .menuShortcut((HotKeyShortcut(storedValue: snippetHotKeyRawValue) ?? .defaultSnippetShortcut).keyboardShortcut)
+        Button("Show Actions") { AppRuntime.shared.showPanel(scope: .actions) }
+            .menuShortcut((HotKeyShortcut(storedValue: actionHotKeyRawValue) ?? .defaultActionShortcut).keyboardShortcut)
 
         Divider()
 

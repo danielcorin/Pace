@@ -4,7 +4,7 @@ import PaceCore
 import QuickLookUI
 import SwiftUI
 
-private final class PacePanel: NSPanel {
+final class PacePanel: NSPanel {
     weak var quickLookController: ImageQuickLookController?
 
     override var canBecomeKey: Bool { true }
@@ -77,7 +77,7 @@ private enum PanelMotion {
     static let showScale: CGFloat = 0.97
 }
 
-private enum PanelMetrics {
+enum PanelMetrics {
     static let width: CGFloat = 760
     static let listWidth: CGFloat = 300
     static let cornerRadius: CGFloat = 16
@@ -109,6 +109,7 @@ private enum PanelMetrics {
 @MainActor
 final class HistoryPanelCoordinator {
     private let model: AppModel
+    private let actions: ActionCenter
     private let quickLookController = ImageQuickLookController()
     private var panel: PacePanel?
     private var targetApplication: NSRunningApplication?
@@ -118,8 +119,18 @@ final class HistoryPanelCoordinator {
     private var escapeMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
 
-    init(model: AppModel) {
+    init(model: AppModel, actions: ActionCenter) {
         self.model = model
+        self.actions = actions
+        actions.isPanelShowingActions = { [weak self] in
+            guard let self else { return false }
+            return self.isVisible && self.model.panelScope == .actions
+        }
+        actions.hidePanel = { [weak self] in self?.hide() }
+        actions.showRun = { [weak self, weak actions] id in
+            actions?.pendingSelection = .run(id)
+            self?.show(scope: .actions)
+        }
         quickLookController.onDismiss = { [weak self] in
             self?.restoreFocusAfterQuickLook()
         }
@@ -144,11 +155,21 @@ final class HistoryPanelCoordinator {
         // Reopening mid-fade completes the pending hide first, so the panel
         // comes back through the same fresh-open path.
         if !wantsVisible, panel?.isVisible == true { finishHiding() }
+        let wasShowingActions = isVisible && model.panelScope == .actions
         wantsVisible = true
+        let previousScope = model.panelScope
         model.panelScope = scope
         let frontmost = NSWorkspace.shared.frontmostApplication
         if frontmost?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             targetApplication = frontmost
+        }
+        actions.targetApplication = targetApplication
+        // A scope change prepares Actions from the view's onChange; reopening
+        // the same scope, or a first open before the view exists, has to
+        // refresh the input here.
+        if scope == .actions, previousScope == .actions || panel == nil {
+            // Already open on Actions: keep its input (a ⌘K item, say).
+            actions.preparePanel(refreshingInput: !wasShowingActions)
         }
         // Unlocking needs no user interaction; never surface a locked panel.
         if model.vaultState == .locked {
@@ -160,7 +181,7 @@ final class HistoryPanelCoordinator {
         let showsPausedBanner = scope == .clipboard && model.capturePaused && !model.records.isEmpty
         resizePanel(
             to: PanelMetrics.preferredHeight(
-                contentUnitCount: scope == .clipboard ? model.records.count : model.snippets.count,
+                contentUnitCount: contentUnitCount(for: scope),
                 showsPausedBanner: showsPausedBanner
             )
         )
@@ -175,6 +196,14 @@ final class HistoryPanelCoordinator {
         // post is missed — leaving the search field unfocused.
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: .paceHistoryPanelDidShow, object: nil)
+        }
+    }
+
+    private func contentUnitCount(for scope: PacePanelScope) -> Int {
+        switch scope {
+        case .clipboard: return model.records.count
+        case .snippets: return model.snippets.count
+        case .actions: return PanelMetrics.maximumVisibleUnits
         }
     }
 
@@ -210,6 +239,7 @@ final class HistoryPanelCoordinator {
         }
         model.query = ""
         model.snippetQuery = ""
+        actions.query = ""
     }
 
     // Purely visual: the panel is already key and taking input, so neither
@@ -319,6 +349,7 @@ final class HistoryPanelCoordinator {
             }
         )
         .environmentObject(model)
+        .environmentObject(actions)
         let hosting = NSHostingView(rootView: root)
         // The root reports its preferred height explicitly; don't let the
         // hosting view install competing window-sizing constraints.
@@ -388,6 +419,7 @@ struct HistoryView: View {
     }
 
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var actionCenter: ActionCenter
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var searchFocused: Bool
     @State private var selection: UUID?
@@ -419,6 +451,7 @@ struct HistoryView: View {
         switch model.panelScope {
         case .clipboard: return model.records.count
         case .snippets: return model.snippets.count
+        case .actions: return PanelMetrics.maximumVisibleUnits
         }
     }
 
@@ -486,12 +519,15 @@ struct HistoryView: View {
             }
         }
         .onChange(of: model.panelScope) { scope in
+            if scope == .actions { actionCenter.preparePanel() }
             if scope == .snippets, pendingSnippetConfiguration != nil {
                 presentPendingSnippetConfiguration()
             } else {
                 cancelSnippetEditor()
             }
-            DispatchQueue.main.async { searchFocused = snippetEditorDraft == nil }
+            if scope != .actions {
+                DispatchQueue.main.async { searchFocused = snippetEditorDraft == nil }
+            }
         }
         .onAppear {
             onPreferredHeightChange(preferredPanelHeight)
@@ -593,6 +629,9 @@ struct HistoryView: View {
         switch model.panelScope {
         case .clipboard: clipboardView
         case .snippets: snippetsView
+        case .actions:
+            ActionsView(scopePicker: scopePicker)
+                .onAppear { installShortcutMonitor() }
         }
     }
 
@@ -1096,6 +1135,8 @@ struct HistoryView: View {
                 Button(record.isPinned ? "Unpin" : "Pin") {
                     Task { await model.togglePin(record) }
                 }
+                Button("Run Action…") { runAction(on: record) }
+                    .keyboardShortcut("k", modifiers: .command)
                 if canPromote(record) {
                     Divider()
                     if let derived = model.snippetDerived(from: record) {
@@ -1134,6 +1175,8 @@ struct HistoryView: View {
             let currentIndex = selection.flatMap { id in model.records.firstIndex { $0.id == id } } ?? -1
             let nextIndex = min(max(currentIndex + delta, 0), model.records.count - 1)
             selection = model.records[nextIndex].id
+        case .actions:
+            break
         case .snippets:
             guard !model.snippets.isEmpty else { return }
             let currentIndex = snippetSelection.flatMap { id in
@@ -1157,6 +1200,8 @@ struct HistoryView: View {
                 NotificationCenter.default.post(name: .paceOpenSettings, object: nil)
                 return nil
             }
+            // The Actions view reads its own keys.
+            if model.panelScope == .actions { return event }
             if event.keyCode == 1, modifiers == .command {  // ⌘S
                 if snippetEditorDraft != nil {
                     saveSnippetEditor()
@@ -1164,6 +1209,11 @@ struct HistoryView: View {
                 }
             }
             if snippetEditorDraft != nil { return event }
+            if model.panelScope == .clipboard,
+               event.keyCode == 40, modifiers == .command {  // ⌘K
+                if let record = selectedRecord { runAction(on: record) }
+                return nil
+            }
             if model.panelScope == .clipboard,
                event.keyCode == 49, modifiers.isEmpty,  // Space
                let record = selectedRecord, record.kind == .image {
@@ -1236,6 +1286,19 @@ struct HistoryView: View {
         case .delete:
             if let snippet = selectedSnippet {
                 Task { await model.deleteSnippet(snippet) }
+            }
+        }
+    }
+
+    /// ⌘K: hands the selected history item to the Actions scope as input.
+    private func runAction(on record: ClipboardRecord) {
+        Task {
+            do {
+                let item = try await model.clipboardItem(for: record)
+                actionCenter.useHistoryItem(item)
+                model.panelScope = .actions
+            } catch {
+                model.notify("Couldn't open that item. \(error.localizedDescription)", style: .error)
             }
         }
     }
@@ -1501,7 +1564,7 @@ struct HistoryView: View {
 // itself. All offsets measure from the top of the content regardless of the
 // document view's coordinate orientation.
 @MainActor
-private final class ScrollViewHandle: ObservableObject {
+final class ScrollViewHandle: ObservableObject {
     // Drives the ⌘-number slot mapping; updated from clip-view bounds changes.
     @Published private(set) var scrollOffset: CGFloat = 0
 
@@ -1572,7 +1635,7 @@ private final class ScrollViewHandle: ObservableObject {
 // SwiftUI's Text lays out an entire large string eagerly on the main thread,
 // which visibly stalls the panel for big clipboard items. NSTextView lays out
 // lazily, so only the visible portion is ever measured.
-private struct PlainTextPreview: NSViewRepresentable {
+struct PlainTextPreview: NSViewRepresentable {
     let text: String
 
     final class Coordinator {
@@ -1620,7 +1683,7 @@ private struct PlainTextPreview: NSViewRepresentable {
 // reserves, which would shift row content) never shows. It also hands the
 // scroll view to `handle` for unit-grid scrolling and the ⌘-number slot
 // mapping.
-private struct OverlayScrollerStyle: NSViewRepresentable {
+struct OverlayScrollerStyle: NSViewRepresentable {
     var handle: ScrollViewHandle?
 
     func makeNSView(context: Context) -> ProbeView {
@@ -1706,7 +1769,7 @@ private struct PanelBackdrop: NSViewRepresentable {
     }
 }
 
-private let panelByteFormatter: ByteCountFormatter = {
+let panelByteFormatter: ByteCountFormatter = {
     let formatter = ByteCountFormatter()
     formatter.countStyle = .file
     return formatter
@@ -1723,7 +1786,7 @@ private func kindIcon(_ kind: ClipboardContentKind) -> String {
     }
 }
 
-private enum KeyHints {
+enum KeyHints {
     static func label(_ action: PanelAction) -> String {
         "\(PanelShortcuts.shortcut(for: action).displayLabel) \(action.title)"
     }
@@ -1766,7 +1829,7 @@ private func highlightedText(_ string: String, terms: [String]) -> Text {
 
 // Hover lives in each row so moving the pointer re-renders one row rather
 // than the whole list.
-private struct RowHighlight: ViewModifier {
+struct RowHighlight: ViewModifier {
     let isSelected: Bool
     @State private var isHovered = false
 
