@@ -128,6 +128,8 @@ final class AppModel: ObservableObject {
     }
 
     func start() {
+        // Drag files left by a previous run outlived their cleanup timers.
+        ImageDragProvider.purgeStaleFiles(all: true)
         refreshPermissions()
         reloadConfigurationIfNeeded()
         let center = NSWorkspace.shared.notificationCenter
@@ -738,6 +740,13 @@ final class AppModel: ObservableObject {
         guard let loaded else { return nil }
         itemImageCache.setObject(loaded, forKey: key, cost: loaded.cost)
         return loaded
+    }
+
+    /// Drags a clipboard image into other apps; the image is decrypted only
+    /// when a drop target asks for it.
+    func imageDragProvider(for record: ClipboardRecord) -> NSItemProvider {
+        guard record.kind == .image, vaultState == .unlocked else { return NSItemProvider() }
+        return ImageDragProvider.make(record: record, store: store)
     }
 
     func itemImageContent(for record: ClipboardRecord) async -> ImagePreviewContent? {

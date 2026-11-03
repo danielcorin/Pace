@@ -2088,6 +2088,8 @@ private struct ClipboardRow: View {
             }
         }
         .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .modifier(ImageDragSource(record: record, image: thumbnail?.image, previewSide: 64))
         .task(id: record.id) {
             switch record.kind {
             case .image:
@@ -2156,6 +2158,36 @@ private struct ClipboardRow: View {
     }
 }
 
+/// Lets an image item be dragged out of the panel into another app.
+private struct ImageDragSource: ViewModifier {
+    @EnvironmentObject private var model: AppModel
+    let record: ClipboardRecord
+    let image: NSImage?
+    let previewSide: CGFloat
+
+    func body(content: Content) -> some View {
+        if record.kind == .image {
+            content.onDrag {
+                model.imageDragProvider(for: record)
+            } preview: {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: previewSide, maxHeight: previewSide)
+                        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                } else {
+                    Image(systemName: "photo")
+                        .font(.system(size: 24))
+                        .frame(width: 48, height: 48)
+                }
+            }
+        } else {
+            content
+        }
+    }
+}
+
 private struct DetailPane: View {
     @EnvironmentObject private var model: AppModel
     let record: ClipboardRecord?
@@ -2202,10 +2234,11 @@ private struct DetailPane: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 .contentShape(Rectangle())
                 .onTapGesture { onQuickLook(record) }
+                .modifier(ImageDragSource(record: record, image: image.image, previewSide: 160))
                 .contextMenu {
                     Button("Quick Look") { onQuickLook(record) }
                 }
-                .help("Quick Look (Space)")
+                .help("Quick Look (Space), or drag into another app")
                 .accessibilityLabel("Quick Look image")
                 .accessibilityAddTraits(.isButton)
                 .padding(14)
