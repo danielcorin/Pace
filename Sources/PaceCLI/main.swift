@@ -342,7 +342,8 @@ private struct Command {
     private func printUsage(_ report: UsageReport) {
         let pastes = report.buckets.map(\.clipboardPastes)
         let expansions = report.buckets.map(\.snippetExpansions)
-        let countWidth = max(6, String(max(pastes.max() ?? 0, expansions.max() ?? 0)).count)
+        let runs = report.buckets.map(\.actionRuns)
+        let countWidth = max(6, String((pastes + expansions + runs).max() ?? 0).count)
         let barWidth = 20
         func pad(_ text: String, _ width: Int, leading: Bool = false) -> String {
             let padding = String(repeating: " ", count: max(0, width - text.count))
@@ -353,7 +354,8 @@ private struct Command {
         Swift.print("")
         let totals = [
             ("Clipboard pastes", report.total.clipboardPastes.formatted(), report.allTime.clipboardPastes.formatted()),
-            ("Snippet expansions", report.total.snippetExpansions.formatted(), report.allTime.snippetExpansions.formatted())
+            ("Snippet expansions", report.total.snippetExpansions.formatted(), report.allTime.snippetExpansions.formatted()),
+            ("Action runs", report.total.actionRuns.formatted(), report.allTime.actionRuns.formatted())
         ]
         let totalWidth = totals.map(\.1.count).max() ?? 0
         let allTimeWidth = totals.map(\.2.count).max() ?? 0
@@ -369,21 +371,24 @@ private struct Command {
         let labelWidth = labels.map(\.count).max() ?? 0
         Swift.print(
             pad("", labelWidth) + "  " + pad("Pastes", countWidth + 1 + barWidth)
-                + "  " + "Expansions"
+                + "  " + pad("Expansions", countWidth + 1 + barWidth)
+                + "  " + "Action runs"
         )
         for (index, label) in labels.enumerated() {
             let row = pad(label, labelWidth)
                 + "  " + pad(String(pastes[index]), countWidth, leading: true)
                 + " " + pad(Self.bar(pastes[index], max: pastes.max() ?? 0, width: barWidth), barWidth)
                 + "  " + pad(String(expansions[index]), countWidth, leading: true)
-                + " " + Self.bar(expansions[index], max: expansions.max() ?? 0, width: barWidth)
+                + " " + pad(Self.bar(expansions[index], max: expansions.max() ?? 0, width: barWidth), barWidth)
+                + "  " + pad(String(runs[index]), countWidth, leading: true)
+                + " " + Self.bar(runs[index], max: runs.max() ?? 0, width: barWidth)
             Swift.print(row.trimmingCharacters(in: .whitespaces))
         }
         Swift.print("")
         if let since = report.trackingSince {
             Swift.print("Tracking since \(since). Each column is scaled to its own maximum.")
         } else {
-            Swift.print("Nothing recorded yet. Pastes from Pace and keyword expansions are counted from now on.")
+            Swift.print("Nothing recorded yet. Pastes from Pace, keyword expansions, and Actions panel runs are counted from now on.")
         }
     }
 
@@ -831,7 +836,8 @@ private struct Command {
     output, and asks before running a confirm step they offer (--yes accepts).
     Run `pace actions new <name>` for a template that documents the protocol.
 
-    `pace stats` charts clipboard pastes and snippet keyword expansions per
-    day (7d, 30d), week (90d), or month (12m). Defaults to 30d.
+    `pace stats` charts clipboard pastes, snippet keyword expansions, and runs
+    started from the Actions panel per day (7d, 30d), week (90d), or month
+    (12m). Defaults to 30d.
     """
 }

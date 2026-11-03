@@ -53,6 +53,8 @@ struct PanelActionInput {
 
 enum ActionsSelection: Hashable {
     case run(UUID)
+    /// The "Completed" row that expands finished runs.
+    case completedRuns
     case action(String)
 
     var runID: UUID? {
@@ -128,14 +130,28 @@ final class ActionRun: ObservableObject, Identifiable {
         segments.last?.output.contains { !$0.isWhitespace } ?? false
     }
 
+    /// The first non-empty output line as plain text, for subtitles and
+    /// notices: list and heading markers and emphasis are stripped.
     var firstResultLine: String? {
         guard let output = segments.last?.output else { return nil }
         return output.prefix(4_000)
             .split(whereSeparator: \.isNewline)
             .lazy
-            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .map { Self.plainText(String($0)) }
             .first { !$0.isEmpty }
     }
+
+    private static func plainText(_ line: String) -> String {
+        line
+            .replacingOccurrences(of: #"^\s*(#{1,6}\s+|[-*•]\s+|\d+[.)]\s+|>\s*)"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\*\*|__|`"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\[([^\]]+)\]\([^)]*\)"#, with: "$1", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Running, or waiting for its confirm step: the runs that stay listed.
+    /// Everything else folds into Completed.
+    var needsAttention: Bool { isRunning || confirmTitle != nil }
 
     var attachments: [ActionAttachment] { result?.attachments ?? [] }
 
@@ -209,6 +225,8 @@ final class ActionCenter: ObservableObject {
     /// Set when the user approved running actions on input that looks
     /// sensitive; cleared whenever the input changes.
     @Published var sensitiveInputApproved = false
+    /// Whether finished runs are listed; folded away on every panel open.
+    @Published var showsCompletedRuns = false
 
     let catalog = PaceActionCatalog()
     private let model: AppModel
@@ -275,14 +293,48 @@ final class ActionCenter: ObservableObject {
         actions.filter { $0.matches(query: query) }
     }
 
-    var visibleRuns: [ActionRun] {
+    private var matchingRuns: [ActionRun] {
         guard !query.isEmpty else { return runs }
         return runs.filter { $0.action.matches(query: query) }
     }
 
+    /// Running runs and ones awaiting confirmation.
+    var activeRuns: [ActionRun] { matchingRuns.filter(\.needsAttention) }
+
+    var completedRuns: [ActionRun] { matchingRuns.filter { !$0.needsAttention } }
+
+    /// Completed runs to list: all of them when expanded, otherwise only the
+    /// one being viewed, so a result doesn't vanish while it's on screen.
+    var listedCompletedRuns: [ActionRun] {
+        showsCompletedRuns ? completedRuns : completedRuns.filter { selection == .run($0.id) }
+    }
+
     /// Rows in display order, for arrow-key movement.
     var orderedSelections: [ActionsSelection] {
-        visibleRuns.map { .run($0.id) } + visibleActions.map { .action($0.id) }
+        let completed = completedRuns.isEmpty ? [] : [ActionsSelection.completedRuns]
+        return activeRuns.map { .run($0.id) }
+            + completed
+            + listedCompletedRuns.map { .run($0.id) }
+            + visibleActions.map { .action($0.id) }
+    }
+
+    func toggleCompletedRuns() {
+        showsCompletedRuns.toggle()
+        // Collapsing hides the selected completed run's neighbors; keep the
+        // focus on the toggle row rather than on a row that disappeared.
+        if !showsCompletedRuns, case .run(let id)? = selection,
+           run(id: id)?.needsAttention == false {
+            selection = .completedRuns
+        }
+    }
+
+    func clearCompletedRuns() {
+        for run in runs where !run.needsAttention { run.session.discard() }
+        runs.removeAll { !$0.needsAttention }
+        showsCompletedRuns = false
+        if selection == .completedRuns || selection.flatMap(\.runID).map({ run(id: $0) == nil }) == true {
+            selectFirstMatch()
+        }
     }
 
     func action(id: String) -> PaceAction? { actions.first { $0.id == id } }
@@ -295,6 +347,7 @@ final class ActionCenter: ObservableObject {
     /// the panel was already open on Actions.
     func preparePanel(refreshingInput: Bool = true) {
         reloadActions(force: true)
+        if refreshingInput { showsCompletedRuns = false }
         if keepsInputOnNextOpen || !refreshingInput {
             keepsInputOnNextOpen = false
         } else {
@@ -337,10 +390,10 @@ final class ActionCenter: ObservableObject {
         )
     }
 
-    /// The newest run when it still needs attention, else the first action
-    /// that fits the input.
+    /// The newest run that's running or awaiting confirmation, else the
+    /// first action that fits the input.
     func selectDefault() {
-        if let latest = runs.first, latest.isRunning || latest.finishedAt.map({ Date().timeIntervalSince($0) < 60 }) == true {
+        if let latest = runs.first(where: \.needsAttention) {
             selection = .run(latest.id)
             return
         }
@@ -353,7 +406,7 @@ final class ActionCenter: ObservableObject {
         if let fitting = candidates.first(where: { $0.isRunnable && $0.accepts(summary) }) ?? candidates.first {
             selection = .action(fitting.id)
         } else {
-            selection = visibleRuns.first.map { .run($0.id) }
+            selection = activeRuns.first.map { .run($0.id) }
         }
     }
 
@@ -408,6 +461,7 @@ final class ActionCenter: ObservableObject {
             trimRetainedRuns()
             if action.output == .panel { selection = .run(run.id) }
             start(run, step: .run)
+            await model.recordUsage(.actionRun)
         }
     }
 
@@ -448,8 +502,11 @@ final class ActionCenter: ObservableObject {
     private func start(_ run: ActionRun, step: ActionStep) {
         let stream = run.session.start(step)
         run.begin(step)
+        // The run lists regroup by phase, which ActionCenter doesn't observe.
+        objectWillChange.send()
         Task {
             for await event in stream { run.apply(event) }
+            objectWillChange.send()
             finished(run)
         }
     }

@@ -699,8 +699,8 @@ final class AppModel: ObservableObject {
     }
 
     /// Stats are best-effort: a failed counter write must never fail the
-    /// paste or expansion that triggered it.
-    private func recordUsage(_ event: UsageEvent) async {
+    /// paste, expansion, or action run that triggered it.
+    func recordUsage(_ event: UsageEvent) async {
         guard (try? await usageStore.record(event)) != nil else { return }
         usageRevision += 1
     }

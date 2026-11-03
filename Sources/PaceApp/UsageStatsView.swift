@@ -3,10 +3,10 @@ import Charts
 import PaceCore
 import SwiftUI
 
-/// The Stats settings tab: clipboard pastes and snippet expansions over time,
-/// drawn as two small-multiple bar charts. Each metric gets its own chart and
-/// y-scale because expansions are typically far rarer than pastes; hovering
-/// either chart reads out the same bucket in both.
+/// The Stats settings tab: clipboard pastes, snippet expansions, and action
+/// runs over time, drawn as small-multiple bar charts. Each metric gets its own
+/// chart and y-scale because expansions and runs are typically far rarer than
+/// pastes; hovering any chart reads out the same bucket in all of them.
 struct UsageStatsView: View {
     @EnvironmentObject private var model: AppModel
     @AppStorage("usageStatsPeriod") private var periodRawValue = UsagePeriod.last30Days.rawValue
@@ -33,6 +33,9 @@ struct UsageStatsView: View {
                         Section {
                             metricRow(.snippetExpansion, report: report)
                         }
+                        Section {
+                            metricRow(.actionRun, report: report)
+                        }
                     } else if let loadError {
                         Section {
                             Label {
@@ -56,6 +59,9 @@ struct UsageStatsView: View {
                         }
                         Section {
                             placeholderRow(.snippetExpansion)
+                        }
+                        Section {
+                            placeholderRow(.actionRun)
                         }
                     }
                 }
@@ -286,6 +292,7 @@ private extension UsageEvent {
         switch self {
         case .clipboardPaste: "Clipboard pastes"
         case .snippetExpansion: "Snippet expansions"
+        case .actionRun: "Action runs"
         }
     }
 
@@ -293,15 +300,17 @@ private extension UsageEvent {
         switch self {
         case .clipboardPaste: count == 1 ? "paste" : "pastes"
         case .snippetExpansion: count == 1 ? "expansion" : "expansions"
+        case .actionRun: count == 1 ? "action run" : "action runs"
         }
     }
 
-    /// Categorical slots 1 and 2, stepped separately for light and dark
+    /// Categorical slots 1–3, stepped separately for light and dark
     /// surfaces (validated for contrast and color-vision separation).
     var seriesColor: Color {
         switch self {
         case .clipboardPaste: Color(light: 0x2A78D6, dark: 0x3987E5)
         case .snippetExpansion: Color(light: 0xEB6834, dark: 0xD95926)
+        case .actionRun: Color(light: 0x1BAF7A, dark: 0x199E70)
         }
     }
 }

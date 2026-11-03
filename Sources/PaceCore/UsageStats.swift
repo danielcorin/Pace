@@ -8,17 +8,30 @@ public enum UsageEvent: String, Codable, CaseIterable, Sendable {
     case clipboardPaste
     /// A snippet inserted by typing its keyword.
     case snippetExpansion
+    /// An action started from the Actions panel. Its confirm and undo steps
+    /// are part of the same run and aren't counted again.
+    case actionRun
 }
 
 public struct UsageCounts: Codable, Equatable, Sendable {
     public var clipboardPastes: Int
     public var snippetExpansions: Int
+    public var actionRuns: Int
 
-    public static let zero = UsageCounts(clipboardPastes: 0, snippetExpansions: 0)
+    public static let zero = UsageCounts()
 
-    public init(clipboardPastes: Int = 0, snippetExpansions: Int = 0) {
+    public init(clipboardPastes: Int = 0, snippetExpansions: Int = 0, actionRuns: Int = 0) {
         self.clipboardPastes = clipboardPastes
         self.snippetExpansions = snippetExpansions
+        self.actionRuns = actionRuns
+    }
+
+    /// Catalogs written before a counter existed simply lack its key.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        clipboardPastes = try container.decodeIfPresent(Int.self, forKey: .clipboardPastes) ?? 0
+        snippetExpansions = try container.decodeIfPresent(Int.self, forKey: .snippetExpansions) ?? 0
+        actionRuns = try container.decodeIfPresent(Int.self, forKey: .actionRuns) ?? 0
     }
 
     public subscript(event: UsageEvent) -> Int {
@@ -26,12 +39,14 @@ public struct UsageCounts: Codable, Equatable, Sendable {
             switch event {
             case .clipboardPaste: clipboardPastes
             case .snippetExpansion: snippetExpansions
+            case .actionRun: actionRuns
             }
         }
         set {
             switch event {
             case .clipboardPaste: clipboardPastes = newValue
             case .snippetExpansion: snippetExpansions = newValue
+            case .actionRun: actionRuns = newValue
             }
         }
     }
@@ -39,7 +54,8 @@ public struct UsageCounts: Codable, Equatable, Sendable {
     public static func + (lhs: UsageCounts, rhs: UsageCounts) -> UsageCounts {
         UsageCounts(
             clipboardPastes: lhs.clipboardPastes + rhs.clipboardPastes,
-            snippetExpansions: lhs.snippetExpansions + rhs.snippetExpansions
+            snippetExpansions: lhs.snippetExpansions + rhs.snippetExpansions,
+            actionRuns: lhs.actionRuns + rhs.actionRuns
         )
     }
 }
@@ -98,16 +114,26 @@ public struct UsageBucket: Codable, Equatable, Sendable, Identifiable {
     public var date: String
     public var clipboardPastes: Int
     public var snippetExpansions: Int
+    public var actionRuns: Int
 
     public var id: String { date }
     public var counts: UsageCounts {
-        UsageCounts(clipboardPastes: clipboardPastes, snippetExpansions: snippetExpansions)
+        UsageCounts(clipboardPastes: clipboardPastes, snippetExpansions: snippetExpansions, actionRuns: actionRuns)
     }
 
     public init(date: String, counts: UsageCounts) {
         self.date = date
         clipboardPastes = counts.clipboardPastes
         snippetExpansions = counts.snippetExpansions
+        actionRuns = counts.actionRuns
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        date = try container.decode(String.self, forKey: .date)
+        clipboardPastes = try container.decodeIfPresent(Int.self, forKey: .clipboardPastes) ?? 0
+        snippetExpansions = try container.decodeIfPresent(Int.self, forKey: .snippetExpansions) ?? 0
+        actionRuns = try container.decodeIfPresent(Int.self, forKey: .actionRuns) ?? 0
     }
 }
 

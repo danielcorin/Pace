@@ -94,21 +94,32 @@ struct ActionsView<ScopePicker: View>: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    let runs = center.visibleRuns
+                    let activeRuns = center.activeRuns
+                    let completedCount = center.completedRuns.count
                     let actions = center.visibleActions
-                    if !runs.isEmpty {
+                    let hasRuns = !activeRuns.isEmpty || completedCount > 0
+                    if hasRuns {
                         sectionHeader("Runs")
-                        ForEach(runs) { run in
-                            RunRow(run: run)
-                                .modifier(ActionListRow(isSelected: center.selection == .run(run.id)))
-                                .id(ActionsSelection.run(run.id))
-                                .onTapGesture(count: 2) { center.performPrimary(on: run) }
-                                .simultaneousGesture(TapGesture().onEnded { center.selection = .run(run.id) })
-                                .contextMenu { runMenu(run) }
+                        ForEach(activeRuns) { runRow($0) }
+                        if completedCount > 0 {
+                            CompletedRunsRow(count: completedCount, isExpanded: center.showsCompletedRuns)
+                                .modifier(ActionListRow(isSelected: center.selection == .completedRuns, height: 32))
+                                .id(ActionsSelection.completedRuns)
+                                .onTapGesture {
+                                    center.selection = .completedRuns
+                                    withAnimation(.easeOut(duration: 0.15)) { center.toggleCompletedRuns() }
+                                }
+                                .contextMenu {
+                                    Button(center.showsCompletedRuns ? "Hide Completed Runs" : "Show Completed Runs") {
+                                        center.toggleCompletedRuns()
+                                    }
+                                    Button("Clear Completed Runs", role: .destructive) { center.clearCompletedRuns() }
+                                }
+                            ForEach(center.listedCompletedRuns) { runRow($0) }
                         }
                     }
                     if !actions.isEmpty {
-                        if !runs.isEmpty { sectionHeader("Actions") }
+                        if hasRuns { sectionHeader("Actions") }
                         ForEach(actions) { action in
                             ActionRow(action: action, blockingReason: center.blockingReason(for: action))
                                 .modifier(ActionListRow(isSelected: center.selection == .action(action.id)))
@@ -118,7 +129,7 @@ struct ActionsView<ScopePicker: View>: View {
                                 .contextMenu { actionMenu(action) }
                         }
                     }
-                    if actions.isEmpty, runs.isEmpty {
+                    if actions.isEmpty, !hasRuns {
                         listEmptyState
                     }
                 }
@@ -130,6 +141,15 @@ struct ActionsView<ScopePicker: View>: View {
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(selected) }
             }
         }
+    }
+
+    private func runRow(_ run: ActionRun) -> some View {
+        RunRow(run: run)
+            .modifier(ActionListRow(isSelected: center.selection == .run(run.id)))
+            .id(ActionsSelection.run(run.id))
+            .onTapGesture(count: 2) { center.performPrimary(on: run) }
+            .simultaneousGesture(TapGesture().onEnded { center.selection = .run(run.id) })
+            .contextMenu { runMenu(run) }
     }
 
     private func sectionHeader(_ title: String) -> some View {
@@ -229,9 +249,32 @@ struct ActionsView<ScopePicker: View>: View {
             } else {
                 placeholder
             }
+        case .completedRuns?:
+            completedRunsDetail
         case nil:
             placeholder
         }
+    }
+
+    private var completedRunsDetail: some View {
+        let count = center.completedRuns.count
+        return VStack(spacing: 10) {
+            Image(systemName: "checkmark.circle")
+                .font(.system(size: 24))
+                .foregroundStyle(.tertiary)
+            Text(count == 1 ? "1 completed run" : "\(count) completed runs")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            HStack {
+                Button(center.showsCompletedRuns ? "Hide" : "Show") { center.toggleCompletedRuns() }
+                Button("Clear All", role: .destructive) { center.clearCompletedRuns() }
+            }
+            .controlSize(.small)
+            Text("\(PanelShortcuts.shortcut(for: .paste).displayLabel) \(center.showsCompletedRuns ? "Hide" : "Show") · \(PanelShortcuts.shortcut(for: .delete).displayLabel) Clear All")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var placeholder: some View {
@@ -261,7 +304,9 @@ struct ActionsView<ScopePicker: View>: View {
     /// ⏎: on an action, move to its instructions field first (when it has
     /// one), then run; on a run, confirm, paste, or open its result.
     private func performPrimary() {
-        if let run = selectedRun {
+        if center.selection == .completedRuns {
+            withAnimation(.easeOut(duration: 0.15)) { center.toggleCompletedRuns() }
+        } else if let run = selectedRun {
             center.performPrimary(on: run)
         } else if let action = selectedAction {
             attemptRun(action, skippingArgument: focus == .argument)
@@ -340,6 +385,8 @@ struct ActionsView<ScopePicker: View>: View {
                 } else if let selected = selectedAction {
                     attemptRun(selected, skippingArgument: true)
                 }
+            case .delete where center.selection == .completedRuns:
+                center.clearCompletedRuns()
             case .delete:
                 guard let run = selectedRun else { return event }
                 center.dismiss(run)
@@ -360,14 +407,39 @@ struct ActionsView<ScopePicker: View>: View {
 
 private struct ActionListRow: ViewModifier {
     let isSelected: Bool
+    var height = PanelMetrics.listUnitHeight
 
     func body(content: Content) -> some View {
         content
             .padding(.horizontal, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: PanelMetrics.listUnitHeight)
+            .frame(height: height)
             .modifier(RowHighlight(isSelected: isSelected))
             .contentShape(Rectangle())
+    }
+}
+
+private struct CompletedRunsRow: View {
+    let count: Int
+    let isExpanded: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "chevron.right")
+                .font(.system(size: 9, weight: .semibold))
+                .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                .frame(width: 28)
+            Text("Completed")
+            Text("\(count)")
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+            Spacer(minLength: 0)
+        }
+        .font(.system(size: 12, weight: .medium))
+        .foregroundStyle(.secondary)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(count) completed runs")
+        .accessibilityHint(isExpanded ? "Hides them" : "Shows them")
     }
 }
 

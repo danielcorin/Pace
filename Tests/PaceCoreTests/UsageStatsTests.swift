@@ -106,6 +106,31 @@ final class UsageStatsTests: XCTestCase {
         XCTAssertEqual(monthly.allTime.snippetExpansions, 11)
     }
 
+    func testActionRunsCountSeparately() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = UsageStatsStore(rootURL: root)
+        try await store.unlock(with: SymmetricKey(size: .bits256))
+        let now = date("2026-10-27T10:00:00-04:00")
+        try await store.record(.actionRun, at: now, calendar: calendar)
+        try await store.record(.actionRun, at: now, calendar: calendar)
+        try await store.record(.clipboardPaste, at: now, calendar: calendar)
+        let report = try await store.report(period: .last7Days, now: now, calendar: calendar)
+        XCTAssertEqual(report.total, UsageCounts(clipboardPastes: 1, actionRuns: 2))
+        XCTAssertEqual(report.buckets.last?.actionRuns, 2)
+    }
+
+    func testCountsWrittenBeforeActionRunsDecode() throws {
+        let legacy = Data(#"{"clipboardPastes":3,"snippetExpansions":1}"#.utf8)
+        let counts = try JSONDecoder.pace.decode(UsageCounts.self, from: legacy)
+        XCTAssertEqual(counts, UsageCounts(clipboardPastes: 3, snippetExpansions: 1))
+
+        let legacyBucket = Data(#"{"date":"2026-10-13","clipboardPastes":3,"snippetExpansions":1}"#.utf8)
+        let bucket = try JSONDecoder.pace.decode(UsageBucket.self, from: legacyBucket)
+        XCTAssertEqual(bucket.actionRuns, 0)
+        XCTAssertEqual(bucket.clipboardPastes, 3)
+    }
+
     private func date(_ value: String) -> Date {
         ISO8601DateFormatter().date(from: value)!
     }
