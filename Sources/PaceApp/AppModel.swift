@@ -1359,18 +1359,32 @@ final class AppModel: ObservableObject {
             defer { self.expansionMonitor.finishMatch() }
             do {
                 var rendered = try await self.renderSnippet(match.snippet)
-                if let delimiter = match.delimiter {
-                    rendered.text += delimiter
+                if await SnippetExpansionMonitor.focusedElementIsPopUpButton(in: match.targetApplication) {
+                    // A pop-up such as an HTML <select> has no text to delete
+                    // and ignores ⌘V; it selects the option matching typed
+                    // text. Wait out the type-ahead window so the keyword
+                    // just typed isn't prefixed to the search, then type the
+                    // expansion's first line.
+                    let choice = rendered.text
+                        .split(whereSeparator: \.isNewline).first
+                        .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+                    guard !choice.isEmpty else { return }
+                    try await Task.sleep(nanoseconds: 1_300_000_000)
+                    try await self.synthesizeTyping(choice, charactersPerEvent: 1, interval: 10_000_000)
+                } else {
+                    if let delimiter = match.delimiter {
+                        rendered.text += delimiter
+                    }
+                    try await Task.sleep(
+                        nanoseconds: UInt64(SnippetExpansionPreferences.injectionDelay * 1_000_000_000)
+                    )
+                    try self.synthesizeDelete(characterCount: match.triggerCharacterCount)
+                    try await self.pasteRenderedSnippet(
+                        rendered,
+                        into: match.targetApplication,
+                        restoresClipboard: SnippetExpansionPreferences.restoresClipboard
+                    )
                 }
-                try await Task.sleep(
-                    nanoseconds: UInt64(SnippetExpansionPreferences.injectionDelay * 1_000_000_000)
-                )
-                try self.synthesizeDelete(characterCount: match.triggerCharacterCount)
-                try await self.pasteRenderedSnippet(
-                    rendered,
-                    into: match.targetApplication,
-                    restoresClipboard: SnippetExpansionPreferences.restoresClipboard
-                )
                 _ = try await self.snippetStore.recordUse(id: match.snippet.id)
                 await self.recordUsage(.snippetExpansion)
                 await self.refreshSnippets()
@@ -1395,6 +1409,25 @@ final class AppModel: ObservableObject {
         into target: NSRunningApplication?,
         restoresClipboard: Bool
     ) async throws {
+        // Chromium-based browsers run ⌘V's Paste command and read the
+        // clipboard, yet often drop the result before it reaches the page
+        // (about half of synthesized pastes in testing), while synthesized
+        // typing lands every time. Type single-line text there; a typed
+        // Return could submit a form, so multi-line text is still pasted.
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let resolvedTarget = target ?? NSWorkspace.shared.frontmostApplication
+            .flatMap { $0.processIdentifier == ownPID ? nil : $0 }
+        if !rendered.text.contains(where: \.isNewline),
+           let resolvedTarget,
+           Self.isChromiumBrowser(resolvedTarget) {
+            try await prepareKeystrokeTarget(resolvedTarget)
+            try await synthesizeTyping(rendered.text)
+            if rendered.cursorMovementFromEnd > 0 {
+                try await Task.sleep(nanoseconds: 45_000_000)
+                try synthesizeLeftArrow(count: rendered.cursorMovementFromEnd)
+            }
+            return
+        }
         let pasteboard = NSPasteboard.general
         let priorContents = PasteboardSnapshot.capture(from: pasteboard)
         pasteboard.clearContents()
@@ -1420,6 +1453,48 @@ final class AppModel: ObservableObject {
 
     private func synthesizeLeftArrow(count: Int) throws {
         try synthesizeKey(keyCode: UInt16(kVK_LeftArrow), count: count)
+    }
+
+    /// Types text as Unicode keystrokes. One keyboard event can carry up to
+    /// 20 UTF-16 units; type-ahead controls need one character per event.
+    private func synthesizeTyping(
+        _ text: String,
+        charactersPerEvent: Int = 20,
+        interval: UInt64 = 5_000_000
+    ) async throws {
+        guard let source = CGEventSource(stateID: .combinedSessionState) else {
+            throw PaceError.unavailable("Could not synthesize the snippet expansion.")
+        }
+        var chunks: [[UniChar]] = []
+        var current: [UniChar] = []
+        var currentCharacters = 0
+        for character in text {
+            let units = Array(String(character).utf16)
+            if currentCharacters == charactersPerEvent || current.count + units.count > 20 {
+                chunks.append(current)
+                current = []
+                currentCharacters = 0
+            }
+            current += units
+            currentCharacters += 1
+        }
+        if !current.isEmpty { chunks.append(current) }
+        for units in chunks {
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
+                throw PaceError.unavailable("Could not synthesize the snippet expansion.")
+            }
+            // Type-ahead measures the gap between keystrokes by event
+            // timestamp, so stamp each one with the current time explicitly.
+            let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            for event in [down, up] {
+                event.timestamp = now
+                event.flags = []
+                event.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+                event.post(tap: .cghidEventTap)
+            }
+            try await Task.sleep(nanoseconds: interval)
+        }
     }
 
     private func synthesizeKey(keyCode: UInt16, count: Int) throws {
@@ -1477,6 +1552,32 @@ final class AppModel: ObservableObject {
         return item
     }
 
+    private static var chromiumBrowserCache: [URL: Bool] = [:]
+
+    /// Chromium browsers ship a "<Name> Framework" with a renderer helper
+    /// app inside. Electron apps share that layout but name the framework
+    /// "Electron Framework"; they stay on the paste path.
+    private static func isChromiumBrowser(_ application: NSRunningApplication) -> Bool {
+        guard let bundleURL = application.bundleURL else { return false }
+        if let cached = chromiumBrowserCache[bundleURL] { return cached }
+        let fileManager = FileManager.default
+        let frameworks = bundleURL.appendingPathComponent("Contents/Frameworks")
+        func children(_ url: URL) -> [String] {
+            (try? fileManager.contentsOfDirectory(atPath: url.path)) ?? []
+        }
+        let result = children(frameworks).contains { name in
+            guard name.hasSuffix(" Framework.framework"),
+                  name != "Electron Framework.framework" else { return false }
+            let versions = frameworks.appendingPathComponent("\(name)/Versions")
+            return children(versions).contains { version in
+                children(versions.appendingPathComponent("\(version)/Helpers"))
+                    .contains { $0.hasSuffix("Helper (Renderer).app") }
+            }
+        }
+        chromiumBrowserCache[bundleURL] = result
+        return result
+    }
+
     // Terminals can only take text through ⌘V, but several terminal programs
     // (Claude Code among them) read images off the clipboard themselves when
     // they receive a Ctrl+V keystroke — so image pastes into terminals use
@@ -1491,10 +1592,12 @@ final class AppModel: ObservableObject {
         "co.zeit.hyper"
     ]
 
-    private func synthesizePaste(
-        into target: NSRunningApplication?,
-        imageContent: Bool = false
-    ) async throws {
+    /// Brings the paste target to the front (unless Pace is itself the
+    /// target) and returns it, once it is ready for synthesized keystrokes.
+    @discardableResult
+    private func prepareKeystrokeTarget(
+        _ target: NSRunningApplication?
+    ) async throws -> NSRunningApplication? {
         refreshPermissions()
         guard hasAccessibilityAccess else {
             throw PaceError.unavailable(Self.accessibilityPasteMessage)
@@ -1518,6 +1621,14 @@ final class AppModel: ObservableObject {
             }
         }
         try await Task.sleep(nanoseconds: 80_000_000)
+        return resolvedTarget
+    }
+
+    private func synthesizePaste(
+        into target: NSRunningApplication?,
+        imageContent: Bool = false
+    ) async throws {
+        let resolvedTarget = try await prepareKeystrokeTarget(target)
         guard let source = CGEventSource(stateID: .combinedSessionState),
               let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) else {

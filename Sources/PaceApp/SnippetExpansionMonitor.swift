@@ -340,22 +340,94 @@ final class SnippetExpansionMonitor {
     }
 
     private static func focusedElementIsSecure() -> Bool {
+        (try? focusedElementString(kAXSubroleAttribute).get()) == "AXSecureTextField"
+    }
+
+    /// Whether focus is on a pop-up menu control such as an HTML `<select>`.
+    /// These ignore Backspace and ⌘V and pick an option from typed text instead.
+    ///
+    /// Browsers often fail accessibility queries while they are still handling
+    /// the keystroke that completed the keyword, so a failed query is retried.
+    /// Chromium-based apps (Chrome, Helium, Arc, Electron) also keep their web
+    /// accessibility tree off, and turn it off again when idle, so no element
+    /// reports focus. Asking for the tree turns it on, and the role is read
+    /// again once it is built; the request is withdrawn afterwards because
+    /// `AXEnhancedUserInterface` also changes how the app animates windows.
+    static func focusedElementIsPopUpButton(in application: NSRunningApplication?) async -> Bool {
+        var lastError = AXError.success
+        var enabledAttribute: String?
+        var appElement: AXUIElement?
+        defer {
+            if let enabledAttribute, let appElement {
+                AXUIElementSetAttributeValue(appElement, enabledAttribute as CFString, kCFBooleanFalse)
+            }
+        }
+        queries: for attempt in 0..<30 {
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 40_000_000) }
+            switch focusedElementString(kAXRoleAttribute) {
+            case .success(let role?):
+                logger.debug("Expansion target role \(role, privacy: .public) after \(attempt + 1) queries")
+                return role == kAXPopUpButtonRole
+            case .success(nil):
+                if enabledAttribute != nil { continue }
+                guard let application else { return false }
+                let element = AXUIElementCreateApplication(application.processIdentifier)
+                guard let attribute = enableAccessibilityTree(in: element, of: application) else {
+                    logger.debug("Expansion target has no focused element")
+                    return false
+                }
+                appElement = element
+                enabledAttribute = attribute
+            case .failure(let failure):
+                lastError = failure.code
+                if enabledAttribute == nil, attempt >= 7 { break queries }
+            }
+        }
+        logger.notice("Could not read the focused element's role (AXError \(lastError.rawValue))")
+        return false
+    }
+
+    /// Returns the attribute the app accepted, if any. Electron accepts
+    /// `AXManualAccessibility`; Chromium browsers accept only the attribute
+    /// VoiceOver sets.
+    private static func enableAccessibilityTree(
+        in element: AXUIElement,
+        of application: NSRunningApplication
+    ) -> String? {
+        for attribute in ["AXManualAccessibility", "AXEnhancedUserInterface"] {
+            let result = AXUIElementSetAttributeValue(element, attribute as CFString, kCFBooleanTrue)
+            logger.debug("Requested \(attribute, privacy: .public) from \(application.bundleIdentifier ?? "?", privacy: .public): AXError \(result.rawValue)")
+            if result == .success { return attribute }
+        }
+        return nil
+    }
+
+    private struct AXFailure: Error { var code: AXError }
+
+    private static func focusedElementString(_ attribute: String) -> Result<String?, AXFailure> {
         let system = AXUIElementCreateSystemWide()
         var focused: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
+        let focusError = AXUIElementCopyAttributeValue(
             system,
             kAXFocusedUIElementAttribute as CFString,
             &focused
-        ) == .success,
-              let focused else { return false }
+        )
+        guard focusError == .success, let focused else {
+            // No focused element at all is an answer, not a transient failure.
+            return focusError == .noValue ? .success(nil) : .failure(AXFailure(code: focusError))
+        }
         let element = unsafeBitCast(focused, to: AXUIElement.self)
-        var subrole: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
+        var value: CFTypeRef?
+        let valueError = AXUIElementCopyAttributeValue(
             element,
-            kAXSubroleAttribute as CFString,
-            &subrole
-        ) == .success else { return false }
-        return (subrole as? String) == "AXSecureTextField"
+            attribute as CFString,
+            &value
+        )
+        switch valueError {
+        case .success: return .success(value as? String)
+        case .noValue, .attributeUnsupported: return .success(nil)
+        default: return .failure(AXFailure(code: valueError))
+        }
     }
 
     deinit {
