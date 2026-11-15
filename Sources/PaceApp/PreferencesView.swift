@@ -97,8 +97,12 @@ struct PreferencesView: View {
 
     private var generalTab: some View {
         Form {
-            Section {
-                accessibilityRow
+            // Healthy-state chrome stays hidden: the row only appears when
+            // access is missing.
+            if !model.hasAccessibilityAccess {
+                Section {
+                    accessibilityRow
+                }
             }
 
             Section {
@@ -190,7 +194,7 @@ struct PreferencesView: View {
                 LabeledContent {
                     Button("Install") { installCLI() }
                 } label: {
-                    Text("Command Line Tool")
+                    Text("Command line tool")
                     Text("Adds the pace command at ~/.local/bin/pace")
                 }
 
@@ -203,9 +207,11 @@ struct PreferencesView: View {
                 }
             } footer: {
                 footerText {
-                    HStack(alignment: .firstTextBaseline) {
-                        Spacer()
-                        Text("Pace \(appVersion)")
+                    if let appVersion {
+                        HStack(alignment: .firstTextBaseline) {
+                            Spacer()
+                            Text("Pace \(appVersion)")
+                        }
                     }
                 }
             }
@@ -220,31 +226,21 @@ struct PreferencesView: View {
         }
     }
 
-    @ViewBuilder
     private var accessibilityRow: some View {
-        if model.hasAccessibilityAccess {
+        HStack {
             Label {
-                Text("Accessibility access granted")
-            } icon: {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-            }
-        } else {
-            HStack {
-                Label {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Accessibility access needed")
-                        Text("Pace needs it to paste into other apps")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                } icon: {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.yellow)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Accessibility access needed")
+                    Text("Pace needs it to paste into other apps")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                Spacer()
-                Button("Grant Access…") { model.requestAccessibilityAccess() }
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
             }
+            Spacer()
+            Button("Grant Access…") { model.requestAccessibilityAccess() }
         }
     }
 
@@ -390,7 +386,7 @@ struct PreferencesView: View {
                 }
                 Button("Add Application…") { addExcludedApplication() }
             } header: {
-                Text("Disabled Applications")
+                Text("Never Expand Snippets In")
             } footer: {
                 footerText {
                     Text("Pace never expands in secure text fields. Keychain Access and common password managers are always excluded.")
@@ -406,7 +402,7 @@ struct PreferencesView: View {
         Form {
             Section {
                 limitRow("Keep history for", value: $days, unit: "days", unlimited: $unlimitedDays)
-                limitRow("Maximum entries", value: $items, unit: "items", unlimited: $unlimitedItems)
+                limitRow("Keep up to", value: $items, unit: "items", unlimited: $unlimitedItems)
                 limitRow("Maximum storage", value: $storageMB, unit: "MB", unlimited: $unlimitedStorage)
             } footer: {
                 footerText {
@@ -594,8 +590,8 @@ struct PreferencesView: View {
             : "Unlock Pace to see the current history size."
     }
 
-    private var appVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+    private var appVersion: String? {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
     }
 
     private func byteString(_ bytes: Int64) -> String {

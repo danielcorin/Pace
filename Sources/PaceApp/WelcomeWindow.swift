@@ -58,6 +58,7 @@ private struct WelcomeView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("hotKeyChoice") private var hotKeyRawValue = HotKeyShortcut.defaultShortcut.storedValue
     @AppStorage("snippetHotKeyChoice") private var snippetHotKeyRawValue = HotKeyShortcut.defaultSnippetShortcut.storedValue
+    @AppStorage(HotKeyShortcut.actionDefaultsKey) private var actionHotKeyRawValue = HotKeyShortcut.defaultActionShortcut.storedValue
     @State private var appeared = false
 
     let onGetStarted: () -> Void
@@ -93,14 +94,20 @@ private struct WelcomeView: View {
                     shortcut: HotKeyShortcut(storedValue: snippetHotKeyRawValue) ?? .defaultSnippetShortcut
                 )
                 .modifier(entrance(3))
+                featureRow(
+                    "bolt",
+                    "Run actions on what you copied",
+                    shortcut: HotKeyShortcut(storedValue: actionHotKeyRawValue) ?? .defaultActionShortcut
+                )
+                .modifier(entrance(4))
                 featureRow("lock.shield", "Everything stays encrypted on this Mac")
-                    .modifier(entrance(4))
+                    .modifier(entrance(5))
             }
             .padding(.top, 26)
 
             accessibilityStep
                 .padding(.top, 22)
-                .modifier(entrance(5))
+                .modifier(entrance(6))
 
             Button(action: onGetStarted) {
                 Text("Get Started")
@@ -110,7 +117,7 @@ private struct WelcomeView: View {
             .controlSize(.large)
             .keyboardShortcut(.defaultAction)
             .padding(.top, 24)
-            .modifier(entrance(6))
+            .modifier(entrance(7))
         }
         .padding(.horizontal, 36)
         .padding(.top, 40)

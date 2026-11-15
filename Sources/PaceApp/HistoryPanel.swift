@@ -1140,7 +1140,7 @@ struct HistoryView: View {
                 if canPromote(record) {
                     Divider()
                     if let derived = model.snippetDerived(from: record) {
-                        Button("Open Snippet “\(derived.name)”…") { openSnippet(derived) }
+                        Button("Open Snippet “\(derived.name)”") { openSnippet(derived) }
                     }
                     Button(record.kind == .image ? "Save OCR Text as Snippet…" : "Save as Snippet…") {
                         beginPromotion(record)
@@ -2262,8 +2262,11 @@ private struct DetailPane: View {
         VStack(alignment: .leading, spacing: 7) {
             infoRow("Source", record.source.name)
             infoRow("Content type", record.kind.displayName)
-            if record.kind == .image, let pixels = image?.pixelSize, pixels.width > 0 {
-                infoRow("Dimensions", "\(Int(pixels.width))×\(Int(pixels.height))")
+            if record.kind == .image {
+                // Shown before the image loads too, so the preview above
+                // doesn't shrink when the value arrives.
+                let pixels = image?.pixelSize ?? .zero
+                infoRow("Dimensions", pixels.width > 0 ? "\(Int(pixels.width))×\(Int(pixels.height))" : " ")
             }
             infoRow("Size", panelByteFormatter.string(fromByteCount: record.byteCount))
             infoRow("Times copied", "\(record.copyCount)")
@@ -2280,12 +2283,12 @@ private struct DetailPane: View {
                 Spacer()
                 if canSaveAsSnippet(record) {
                     if let derivedSnippet {
-                        Button("Open \(derivedSnippet.keyword ?? derivedSnippet.name)") {
+                        Button("Open Snippet") {
                             onOpenSnippet(derivedSnippet)
                         }
                         .buttonStyle(.borderless)
                     }
-                    Button(record.kind == .image ? "Save OCR as Snippet…" : "Save as Snippet…") {
+                    Button(record.kind == .image ? "Save OCR Text as Snippet…" : "Save as Snippet…") {
                         onSaveAsSnippet(record)
                     }
                     .buttonStyle(.borderless)
@@ -2567,17 +2570,20 @@ private struct SnippetEditorPane: View {
                     .frame(minHeight: 90)
             }
 
-            if let errorMessage {
-                Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
-            }
-
             HStack {
-                Text("⌘S to save · Esc to cancel")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                // An error takes the hint's place, so the template editor
+                // above never shrinks when one appears.
+                if let errorMessage {
+                    Text(errorMessage)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                        .help(errorMessage)
+                } else {
+                    Text("⌘S to save · Esc to cancel")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
                 Spacer()
                 Button("Cancel", action: onCancel)
                 Button("Save", action: onSave)
@@ -2587,6 +2593,8 @@ private struct SnippetEditorPane: View {
                             || draft.snippet.template.isEmpty
                     )
             }
+            // Tall enough for a two-line error, so it never grows.
+            .frame(minHeight: 30)
         }
         .padding(14)
         .onAppear { nameFocused = true }

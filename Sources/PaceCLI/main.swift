@@ -4,9 +4,10 @@ import PaceCore
 
 struct PaceCLI {
     static func main() {
+        let command = Command(arguments: Array(CommandLine.arguments.dropFirst()))
         do {
-            let command = try Command(arguments: Array(CommandLine.arguments.dropFirst()))
-            if command.printHelpIfRequested() { return }
+            if try command.printHelpIfRequested() { return }
+            try command.validateOptions()
             if try command.runLocally() { return }
             let response = try sendLaunchingPaceIfNeeded(command.request)
             guard response.success else {
@@ -16,7 +17,11 @@ struct PaceCLI {
             }
             try command.print(response)
         } catch {
-            FileHandle.standardError.write(Data(("pace: \(error.localizedDescription)\n").utf8))
+            var message = "pace: \(error.localizedDescription)\n"
+            if case PaceError.invalidArgument = error, let hint = command.usageHint {
+                message += hint + "\n"
+            }
+            FileHandle.standardError.write(Data(message.utf8))
             Darwin.exit(error is PaceError ? 2 : 1)
         }
     }
@@ -106,7 +111,7 @@ PaceCLI.main()
 
 private struct Command {
     private static let booleanOptions: Set<String> = [
-        "--clear-keyword", "--clear-tags", "--encrypt", "--expand", "--force",
+        "--clear-keyword", "--clear-tags", "--encrypt", "--expand", "--force", "--help",
         "--include-pinned", "--json", "--no-expand", "--ocr-text", "--pin", "--pinned", "--plain",
         "--protect-pinned", "--prune", "--snippets", "--unpin", "--yes"
     ]
@@ -116,7 +121,7 @@ private struct Command {
     let options: [String: String]
     let flags: Set<String>
 
-    init(arguments: [String]) throws {
+    init(arguments: [String]) {
         guard let name = arguments.first else {
             self.name = "help"
             values = []
@@ -130,7 +135,7 @@ private struct Command {
         var flags = Set<String>()
         var index = 1
         while index < arguments.count {
-            let argument = arguments[index]
+            let argument = arguments[index] == "-h" ? "--help" : arguments[index]
             if argument.hasPrefix("--") {
                 if Self.booleanOptions.contains(argument) {
                     flags.insert(argument)
@@ -155,8 +160,6 @@ private struct Command {
     var request: IPCRequest {
         get throws {
             switch name {
-            case "help", "--help", "-h":
-                return IPCRequest(command: .status, arguments: ["help": "true"])
             case "status": return IPCRequest(command: .status)
             case "show":
                 let scope = flags.contains("--snippets") ? "snippets" : options["--mode"]
@@ -212,17 +215,108 @@ private struct Command {
         }
     }
 
-    func printHelpIfRequested() -> Bool {
-        guard name == "help" || name == "--help" || name == "-h" else { return false }
-        Swift.print(Self.help)
+    /// `pace help`, `pace help <command>`, and `--help` / `-h` after any
+    /// command print help and exit 0 without contacting the app.
+    func printHelpIfRequested() throws -> Bool {
+        if Self.isHelp(name) {
+            guard let topic = values.first else {
+                Swift.print(Self.help)
+                return true
+            }
+            guard let usage = Self.usage(for: topic) else {
+                throw PaceError.invalidArgument("Unknown command '\(topic)'. Run `pace help` for usage.")
+            }
+            Swift.print(usage)
+            return true
+        }
+        guard flags.contains("--help"), let usage = Self.usage(for: name) else { return false }
+        Swift.print(usage)
         return true
     }
 
-    func print(_ response: IPCResponse) throws {
-        if name == "help" || name == "--help" || name == "-h" {
-            Swift.print(Self.help)
-            return
+    private static func isHelp(_ name: String) -> Bool {
+        name == "help" || name == "--help" || name == "-h"
+    }
+
+    /// Commands as their help topics: aliases share their command's entry.
+    private static func canonicalName(_ name: String) -> String {
+        switch name {
+        case "snippet": return "snippets"
+        case "action": return "actions"
+        default: return name
         }
+    }
+
+    /// Shown after a usage error, pointing at the command's own help.
+    var usageHint: String? {
+        guard !Self.isHelp(name), Self.allowedOptions[Self.canonicalName(name)] != nil else { return nil }
+        return "Run `pace \(Self.canonicalName(name)) --help` for usage."
+    }
+
+    /// The help lines for one command, taken from the full usage list so the
+    /// two never drift apart, plus that command's notes.
+    private static func usage(for command: String) -> String? {
+        let command = canonicalName(command)
+        guard allowedOptions[command] != nil else { return nil }
+        var lines: [String] = []
+        var including = false
+        for line in usageList.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if let range = trimmed.range(of: "pace "), trimmed.hasPrefix("pace ") || trimmed.hasPrefix("command | pace ") {
+                let names = trimmed[range.upperBound...]
+                    .prefix { !$0.isWhitespace }
+                    .split(separator: "|")
+                    .map(String.init)
+                including = names.contains(command)
+            } else if trimmed.isEmpty {
+                including = false
+            }
+            if including { lines.append(String(line)) }
+        }
+        guard !lines.isEmpty else { return nil }
+        var text = "Usage:\n" + lines.joined(separator: "\n")
+        if let notes = notes[command] { text += "\n\n" + notes }
+        return text
+    }
+
+    /// The options each command accepts. `--json` and `--help` work everywhere.
+    private static let allowedOptions: [String: Set<String>] = [
+        "status": [], "unlock": [], "lock": [], "clear": [],
+        "show": ["--mode", "--snippets"],
+        "list": ["--limit"],
+        "search": ["--limit"],
+        "get": ["--ocr-text", "--output"],
+        "add": ["--source", "--session", "--file", "--timestamp", "--source-kind", "--type"],
+        "copy": ["--plain", "--ocr-text"], "paste": ["--plain", "--ocr-text"],
+        "pin": [], "unpin": [], "delete": [],
+        "retention": ["--days", "--max-items", "--max-storage", "--protect-pinned", "--include-pinned", "--prune"],
+        "export": ["--output", "--encrypt", "--only", "--force"],
+        "stats": ["--period"],
+        "config": [],
+        "actions": ["--template", "--force", "--arg", "--file", "--item", "--yes"],
+        "snippets": [
+            "--limit", "--name", "--keyword", "--tags", "--clear-keyword", "--clear-tags",
+            "--pin", "--pinned", "--unpin", "--expand", "--no-expand", "--template", "--file"
+        ]
+    ]
+
+    /// Rejects misspelled options and missing or malformed values instead of
+    /// silently ignoring them.
+    func validateOptions() throws {
+        guard let allowed = Self.allowedOptions[Self.canonicalName(name)] else { return }
+        let given = Set(options.keys).union(flags).subtracting(["--json", "--help"])
+        for option in given.sorted() where !allowed.contains(option) {
+            throw PaceError.invalidArgument("Unknown option \(option) for `pace \(Self.canonicalName(name))`.")
+        }
+        for flag in flags.sorted() where !Self.booleanOptions.contains(flag) && allowed.contains(flag) {
+            throw PaceError.invalidArgument("\(flag) needs a value.")
+        }
+        if let limit = options["--limit"], (Int(limit) ?? 0) < 1 {
+            throw PaceError.invalidArgument("--limit must be a whole number greater than 0.")
+        }
+    }
+
+    func print(_ response: IPCResponse) throws {
         if flags.contains("--json") {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
@@ -328,13 +422,25 @@ private struct Command {
         }
 
         if let policy = response.retentionPolicy {
-            Swift.print("Days: \(policy.maximumAgeDays.map(String.init) ?? "unlimited")")
-            Swift.print("Items: \(policy.maximumItemCount.map(String.init) ?? "unlimited")")
-            Swift.print("Storage: \(policy.maximumStorageBytes.map(String.init) ?? "unlimited") bytes")
-            Swift.print("Protect pinned: \(policy.protectsPinnedItems ? "yes" : "no")")
+            let days = policy.maximumAgeDays.map { $0 == 1 ? "1 day" : "\($0.formatted()) days" }
+            let storage = policy.maximumStorageBytes.map {
+                ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
+            }
+            Swift.print("Keep history for: \(days ?? "unlimited")")
+            Swift.print("Keep up to: \(policy.maximumItemCount.map { "\($0.formatted()) items" } ?? "unlimited")")
+            Swift.print("Maximum storage: \(storage ?? "unlimited")")
+            Swift.print("Protect pinned items: \(policy.protectsPinnedItems ? "yes" : "no")")
         }
         if let report = response.retentionReport {
-            Swift.print("Cleanup: \(report.itemCount) items, \(ByteCountFormatter.string(fromByteCount: report.byteCount, countStyle: .file))")
+            let operation = name == "retention" ? values.first : nil
+            let applied = operation == "prune" || (operation == "set" && flags.contains("--prune"))
+            let items = report.itemCount == 1 ? "1 item" : "\(report.itemCount.formatted()) items"
+            let size = ByteCountFormatter.string(fromByteCount: report.byteCount, countStyle: .file)
+            if report.itemCount == 0 {
+                Swift.print(applied ? "Cleanup removed nothing." : "Cleanup would remove nothing.")
+            } else {
+                Swift.print(applied ? "Removed \(items) (\(size))." : "Cleanup would remove \(items) (\(size)).")
+            }
         }
         if let message = response.message { Swift.print(message) }
     }
@@ -774,10 +880,7 @@ private struct Command {
         return String(bytes)
     }
 
-    private static let help = """
-    Pace — encrypted clipboard and snippet manager
-
-    Usage:
+    private static let usageList = """
       pace status|unlock|lock
       pace show [--mode clipboard|snippets|actions]
       pace list [--limit N] [--json]
@@ -785,14 +888,15 @@ private struct Command {
       pace get <id> [--ocr-text|--output PATH] [--json]
       pace add <text> [--source NAME] [--session ID]
       pace add --file PATH [--source NAME]
-      command | pace add [--source NAME]
+      command | pace add [--source NAME] [--type UTI]
       pace add … [--timestamp UNIX_SECONDS] [--source-kind application|agent]
       pace copy|paste <id> [--plain|--ocr-text]
       pace pin|unpin|delete <id>
       pace clear
       pace retention show|preview|prune
       pace retention set [--days N|unlimited] [--max-items N|unlimited]
-                         [--max-storage 1GB|unlimited] [--prune]
+                         [--max-storage 1GB|unlimited]
+                         [--protect-pinned|--include-pinned] [--prune]
       pace export --output PATH [--encrypt] [--only clipboard|snippets] [--force]
       pace export decrypt <file> [--output PATH] [--force]
       pace stats [--period 7d|30d|90d|12m] [--json]
@@ -821,23 +925,51 @@ private struct Command {
       pace snippets copy|paste|delete <id|name|keyword> [--json]
       pace snippets promote <clipboard-item-id> [--name NAME] [--keyword KEY]
                             [--tags a,b] [--pin] [--expand] [--json]
-
-    Snippets can be addressed by full or unique-prefix UUID, exact keyword,
-    or case-insensitive name. Template input may be positional, piped on stdin,
-    or supplied with --template/--file.
-
-    Exports are JSON. Plain exports are unencrypted; --encrypt prompts for a
-    passphrase (or reads PACE_EXPORT_PASSPHRASE) and seals the file with
-    AES-256-GCM. `pace config` edits ~/.config/pace/config.toml, which the
-    app re-reads on the next copy.
-
-    Actions are executable scripts in ~/.config/pace/actions. `pace actions run`
-    hands them the clipboard (or --file, --item, or piped stdin), streams their
-    output, and asks before running a confirm step they offer (--yes accepts).
-    Run `pace actions new <name>` for a template that documents the protocol.
-
-    `pace stats` charts clipboard pastes, snippet keyword expansions, and runs
-    started from the Actions panel per day (7d, 30d), week (90d), or month
-    (12m). Defaults to 30d.
     """
+
+    private static let notes: [String: String] = [
+        "snippets": """
+        Snippets can be addressed by full or unique-prefix UUID, exact keyword,
+        or case-insensitive name. Template input may be positional, piped on stdin,
+        or supplied with --template/--file.
+        """,
+        "export": """
+        Exports are JSON. Plain exports are unencrypted; --encrypt prompts for a
+        passphrase (or reads PACE_EXPORT_PASSPHRASE) and seals the file with
+        AES-256-GCM.
+        """,
+        "config": """
+        `pace config` edits ~/.config/pace/config.toml, which the app re-reads on
+        the next copy.
+        """,
+        "actions": """
+        Actions are executable scripts in ~/.config/pace/actions. `pace actions run`
+        hands them the clipboard (or --file, --item, or piped stdin), streams their
+        output, and asks before running a confirm step they offer (--yes accepts).
+        Run `pace actions new <name>` for a template that documents the protocol.
+        """,
+        "stats": """
+        `pace stats` charts clipboard pastes, snippet keyword expansions, and runs
+        started from the Actions panel per day (7d, 30d), week (90d), or month
+        (12m). Defaults to 30d.
+        """,
+        "add": """
+        Piped input is stored as plain text unless --type names another uniform
+        type identifier, such as public.html.
+        """
+    ]
+
+    private static var help: String {
+        let sections = ["snippets", "export", "config", "actions", "stats"].compactMap { notes[$0] }
+        return """
+        Pace: encrypted clipboard history and snippets
+
+        Usage:
+        \(usageList)
+
+        Run `pace help <command>` or `pace <command> --help` for one command.
+
+        \(sections.joined(separator: "\n\n"))
+        """
+    }
 }

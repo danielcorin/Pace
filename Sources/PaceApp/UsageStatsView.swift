@@ -165,6 +165,7 @@ struct UsageStatsView: View {
                 Spacer()
                 Text(value.formatted())
                     .font(.system(size: 26, weight: .semibold))
+                    .monospacedDigit()
             }
             chart(event, report: report)
                 .frame(height: 84)

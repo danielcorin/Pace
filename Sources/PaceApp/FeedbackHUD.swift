@@ -101,7 +101,17 @@ final class FeedbackHUD {
 
     /// Top center of the screen under the pointer, just below the menu bar.
     private func frame(for feedback: Feedback) -> NSRect {
-        let measured = NSHostingView(rootView: FeedbackPill(feedback: feedback, onAction: {})).fittingSize
+        let pill = FeedbackPill(feedback: feedback, onAction: {})
+        var measured = NSHostingView(rootView: pill).fittingSize
+        if measured.width >= HUDMetrics.maximumPillWidth {
+            // The pill caps its own width, so reaching the cap means the text
+            // doesn't fit on one line: measure again at the cap so a warning
+            // or error wraps onto its second line instead of being cut off.
+            let wrapped = pill
+                .frame(width: HUDMetrics.maximumPillWidth)
+                .fixedSize(horizontal: false, vertical: true)
+            measured = NSHostingView(rootView: wrapped).fittingSize
+        }
         let pillWidth = min(ceil(measured.width), HUDMetrics.maximumPillWidth)
         let size = NSSize(
             width: pillWidth + HUDMetrics.margin * 2,
@@ -160,11 +170,13 @@ private struct Feedback: Identifiable {
         }
     }
 
+    var wraps: Bool { style == .warning || style == .error }
+
     var tint: Color {
         switch style {
         case .success: return .green
         case .info: return .secondary
-        case .warning: return .yellow
+        case .warning: return .orange
         case .error: return .red
         }
     }
@@ -241,7 +253,8 @@ private struct FeedbackPill: View {
                 .foregroundStyle(feedback.tint)
             Text(feedback.message)
                 .font(.system(size: 13, weight: .medium))
-                .lineLimit(1)
+                // Problems get a second line so their reason stays readable.
+                .lineLimit(feedback.wraps ? 2 : 1)
                 .truncationMode(.tail)
                 .layoutPriority(1)
             if let action = feedback.action {
@@ -262,8 +275,10 @@ private struct FeedbackPill: View {
         .padding(.trailing, feedback.action == nil ? 16 : 14)
         .padding(.vertical, 9)
         .frame(maxWidth: HUDMetrics.maximumPillWidth)
-        .background(.regularMaterial, in: Capsule(style: .continuous))
-        .overlay(Capsule(style: .continuous).strokeBorder(.separator))
+        // A capsule on one line; the radius is capped so two lines keep
+        // straight sides instead of bulging ends.
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(.separator))
         .shadow(color: .black.opacity(0.16), radius: 9, y: 3)
         .accessibilityElement(children: .combine)
     }

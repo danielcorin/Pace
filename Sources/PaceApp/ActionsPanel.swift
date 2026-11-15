@@ -13,6 +13,7 @@ struct ActionsView<ScopePicker: View>: View {
 
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var center: ActionCenter
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let scopePicker: ScopePicker
     @FocusState private var focus: Field?
     @State private var arguments: [String: String] = [:]
@@ -107,11 +108,11 @@ struct ActionsView<ScopePicker: View>: View {
                                 .id(ActionsSelection.completedRuns)
                                 .onTapGesture {
                                     center.selection = .completedRuns
-                                    withAnimation(.easeOut(duration: 0.15)) { center.toggleCompletedRuns() }
+                                    toggleCompletedRuns()
                                 }
                                 .contextMenu {
                                     Button(center.showsCompletedRuns ? "Hide Completed Runs" : "Show Completed Runs") {
-                                        center.toggleCompletedRuns()
+                                        toggleCompletedRuns()
                                     }
                                     Button("Clear Completed Runs", role: .destructive) { center.clearCompletedRuns() }
                                 }
@@ -138,7 +139,8 @@ struct ActionsView<ScopePicker: View>: View {
             }
             .onChange(of: center.selection) { selected in
                 guard let selected else { return }
-                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(selected) }
+                // Instant, like Clipboard and Snippets, so a held arrow key keeps up.
+                proxy.scrollTo(selected)
             }
         }
     }
@@ -266,13 +268,12 @@ struct ActionsView<ScopePicker: View>: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             HStack {
-                Button(center.showsCompletedRuns ? "Hide" : "Show") { center.toggleCompletedRuns() }
+                Button(center.showsCompletedRuns ? "Hide" : "Show") { toggleCompletedRuns() }
+                    .help("\(center.showsCompletedRuns ? "Hide" : "Show") (\(PanelShortcuts.shortcut(for: .paste).displayLabel))")
                 Button("Clear All", role: .destructive) { center.clearCompletedRuns() }
+                    .help("Clear All (\(PanelShortcuts.shortcut(for: .delete).displayLabel))")
             }
             .controlSize(.small)
-            Text("\(PanelShortcuts.shortcut(for: .paste).displayLabel) \(center.showsCompletedRuns ? "Hide" : "Show") · \(PanelShortcuts.shortcut(for: .delete).displayLabel) Clear All")
-                .font(.system(size: 10))
-                .foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -291,6 +292,15 @@ struct ActionsView<ScopePicker: View>: View {
 
     // MARK: Commands
 
+    /// Every way of toggling the Completed group animates the same way.
+    private func toggleCompletedRuns() {
+        if reduceMotion {
+            center.toggleCompletedRuns()
+        } else {
+            withAnimation(.easeOut(duration: 0.15)) { center.toggleCompletedRuns() }
+        }
+    }
+
     private var selectedRun: ActionRun? {
         guard case .run(let id)? = center.selection else { return nil }
         return center.run(id: id)
@@ -305,7 +315,7 @@ struct ActionsView<ScopePicker: View>: View {
     /// one), then run; on a run, confirm, paste, or open its result.
     private func performPrimary() {
         if center.selection == .completedRuns {
-            withAnimation(.easeOut(duration: 0.15)) { center.toggleCompletedRuns() }
+            toggleCompletedRuns()
         } else if let run = selectedRun {
             center.performPrimary(on: run)
         } else if let action = selectedAction {
@@ -968,13 +978,13 @@ private struct RunDetail: View {
             if let undoTitle = run.undoTitle {
                 Button(undoTitle) { center.undo(run) }
                     .controlSize(.small)
-                    .help("⌘Z")
+                    .help("\(undoTitle) (⌘Z)")
             }
             if let confirmTitle = run.confirmTitle {
                 Button(confirmTitle) { center.confirm(run) }
                     .controlSize(.small)
                     .buttonStyle(.borderedProminent)
-                    .help(PanelShortcuts.shortcut(for: .paste).displayLabel)
+                    .help("\(confirmTitle) (\(PanelShortcuts.shortcut(for: .paste).displayLabel))")
             }
         }
         .padding(.horizontal, 12)
