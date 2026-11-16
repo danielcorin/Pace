@@ -135,7 +135,21 @@ final class FeedbackHUD {
     private func makePanel() -> FeedbackHUDPanel {
         let panel = FeedbackHUDPanel()
         let view = FeedbackHUDView(state: state) { [weak self] action in self?.perform(action) }
-        panel.contentView = FirstMouseHostingView(rootView: view)
+        // The hosting view sits in a plain container that resizes it with
+        // the window, rather than being the content view itself. The HUD
+        // sizes its window in `frame(for:)`; as the window's only view, the
+        // hosting view's constraint updates during a crossfade could exceed
+        // AppKit's limit on constraint passes, which is about one per view
+        // in the window, and AppKit aborts the app. That happened when
+        // several messages arrived at once, such as starting three actions.
+        let hostingView = FirstMouseHostingView(rootView: view)
+        hostingView.sizingOptions = []
+        hostingView.translatesAutoresizingMaskIntoConstraints = true
+        hostingView.autoresizingMask = [.width, .height]
+        let container = NSView()
+        hostingView.frame = container.bounds
+        container.addSubview(hostingView)
+        panel.contentView = container
         self.panel = panel
         return panel
     }
